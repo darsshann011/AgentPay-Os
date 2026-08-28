@@ -63,6 +63,15 @@ test('Idempotency & Webhook Service - Step 5 Verification', async (t) => {
 
   await t.test('3. Should update transaction state upon webhook arrival', async () => {
     const agentId = uuidv4();
+    await createAgent({
+      id: agentId,
+      name: 'Webhook Agent',
+      budget_total: 50000,
+      budget_remaining: 50000,
+      allowed_merchants: ['Cab Vendor B'],
+      velocity_limit: 5
+    });
+
     const tx = await createTransaction({
       agent_id: agentId,
       amount: 5000,

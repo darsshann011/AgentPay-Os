@@ -24,7 +24,7 @@ router.post('/', async (req, res) => {
   try {
     const {
       prompt,
-      agent_id = DEFAULT_TRAVELBOT_ID,
+      agent_id,
       amount: rawAmount,
       merchant: rawMerchant,
       sku: rawSku,
@@ -32,18 +32,32 @@ router.post('/', async (req, res) => {
       payment_type = 'ORDER' // ORDER | PAYMENT_LINK
     } = req.body;
 
-    // Determine or generate Idempotency Key
+    // 1. Resolve Active Agent
+    const agent = await getAgent(agent_id);
+    if (!agent) {
+      console.error(`[Policy Firewall] ❌ Agent lookup failed for agent_id: '${agent_id}'`);
+      await addAuditLog(null, 'DENIED', { reason: 'AGENT_NOT_FOUND', agent_id: agent_id || 'unspecified' });
+      return res.status(404).json({
+        decision: 'DENY',
+        reason: `Agent with ID '${agent_id}' not found in database`,
+        ruleViolated: 'AGENT_NOT_FOUND'
+      });
+    }
+
+    const resolvedAgentId = agent.id;
+
+    // 2. Determine or generate Idempotency Key
     const idempotencyKey =
       req.headers['idempotency-key'] ||
       req.body.idempotency_key ||
       (prompt
-        ? `ik_prompt_${crypto.createHash('sha256').update(`${agent_id}:${prompt}`).digest('hex').substring(0, 16)}`
+        ? `ik_prompt_${crypto.createHash('sha256').update(`${resolvedAgentId}:${prompt}`).digest('hex').substring(0, 16)}`
         : `ik_tx_${uuidv4().substring(0, 16)}`);
 
-    // 1. Check Idempotency State
+    // 3. Check Idempotency State (Block Replays & Concurrent Duplicates)
     const idempotencyCheck = await checkIdempotency(idempotencyKey);
     if (idempotencyCheck.isDuplicate) {
-      console.log(`[Policy Firewall] Duplicate request intercepted for key: ${idempotencyKey}`);
+      console.log(`[Policy Firewall] 🛡️ Duplicate request intercepted for key: ${idempotencyKey}`);
       const duplicateResult = await handleDuplicateRequest(
         idempotencyKey,
         idempotencyCheck.transaction,
@@ -58,12 +72,12 @@ router.post('/', async (req, res) => {
       });
     }
 
-    // 2. Extract Intent (AI Layer / Natural Language Parser)
+    // 4. Extract Intent (AI Layer / Natural Language Parser)
     let structuredIntent = null;
     let purchaseRequest = {};
 
     if (prompt) {
-      console.log(`[AI Intent Layer] Parsing buyer prompt: "${prompt}"`);
+      console.log(`[AI Intent Layer] 🤖 Parsing buyer prompt: "${prompt}"`);
       structuredIntent = await parseIntent(prompt);
       purchaseRequest = {
         amount: structuredIntent.amount,
@@ -82,29 +96,19 @@ router.post('/', async (req, res) => {
       };
     }
 
-    // 3. Log AGENT_REQUESTED audit event
+    // 5. Log AGENT_REQUESTED audit event
     await addAuditLog(null, 'AGENT_REQUESTED', {
-      agent_id,
+      agent_id: resolvedAgentId,
+      agent_name: agent.name,
       prompt: prompt || null,
       idempotency_key: idempotencyKey,
       extracted_intent: purchaseRequest
     });
 
-    // 4. Check Agent Existence
-    const agent = await getAgent(agent_id);
-    if (!agent) {
-      await addAuditLog(null, 'DENIED', { reason: 'AGENT_NOT_FOUND', agent_id });
-      return res.status(404).json({
-        decision: 'DENY',
-        reason: `Agent with ID ${agent_id} not found`,
-        ruleViolated: 'AGENT_NOT_FOUND'
-      });
-    }
-
-    // 5. Atomic Policy Evaluation with Row Locking (SELECT ... FOR UPDATE)
-    console.log(`[Policy Engine] Deterministic evaluation for Agent: ${agent.name}, Amount: ₹${purchaseRequest.amount}, Merchant: ${purchaseRequest.merchant}`);
+    // 6. Atomic Policy Evaluation with Row Locking (SELECT ... FOR UPDATE)
+    console.log(`[Policy Engine] ⚖️ Deterministic evaluation for Agent: '${agent.name}', Amount: ₹${purchaseRequest.amount}, Merchant: '${purchaseRequest.merchant}'`);
     const deductionResult = await processAtomicBudgetDeduction(
-      agent_id,
+      resolvedAgentId,
       purchaseRequest.amount,
       purchaseRequest.merchant,
       idempotencyKey
@@ -125,7 +129,7 @@ router.post('/', async (req, res) => {
 
     const transactionId = deductionResult.transaction_id;
 
-    // 6. Policy ALLOWED -> Call Razorpay API
+    // 7. Policy ALLOWED -> Call Razorpay API
     console.log(`[Razorpay Service] ✅ Policy ALLOWED. Initiating Razorpay payment...`);
     let razorpayResponse = null;
 
@@ -135,7 +139,7 @@ router.post('/', async (req, res) => {
           amount: purchaseRequest.amount,
           description: `Agent purchase: ${purchaseRequest.sku}`,
           notes: {
-            agent_id,
+            agent_id: resolvedAgentId,
             transaction_id: transactionId,
             sku: purchaseRequest.sku,
             merchant: purchaseRequest.merchant
@@ -146,7 +150,7 @@ router.post('/', async (req, res) => {
           amount: purchaseRequest.amount,
           receipt: `rcpt_${transactionId.substring(0, 8)}`,
           notes: {
-            agent_id,
+            agent_id: resolvedAgentId,
             transaction_id: transactionId,
             sku: purchaseRequest.sku,
             merchant: purchaseRequest.merchant
@@ -154,14 +158,14 @@ router.post('/', async (req, res) => {
         });
       }
 
-      // 7. Update transaction with Razorpay order/link ID
+      // 8. Update transaction with Razorpay order/link ID
       const orderOrLinkId = razorpayResponse.id;
       await updateTransaction(transactionId, {
         razorpay_order_id: orderOrLinkId,
         status: 'ALLOWED'
       });
 
-      // 8. Log PAYMENT_CREATED in Audit Log
+      // 9. Log PAYMENT_CREATED in Audit Log
       await addAuditLog(transactionId, 'PAYMENT_CREATED', {
         razorpay_id: orderOrLinkId,
         payment_type,

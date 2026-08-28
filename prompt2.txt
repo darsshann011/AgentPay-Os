@@ -1,0 +1,94 @@
+========================================================
+BUG FIX PROMPT — AgentPay OS
+Paste this into Antigravity
+========================================================
+
+I'm seeing two bugs in my AgentPay OS project. Diagnose and fix both.
+
+--------------------------------------------------------
+BUG 1: Every request is being DENIED with reason "AGENT_NOT_FOUND"
+--------------------------------------------------------
+
+Symptom: In my audit_log table, every single transaction shows an
+AGENT_REQUESTED event (meaning the Gemini intent parser is working fine),
+immediately followed by a DENIED event with detail:
+  { "reason": "AGENT_NOT_FOUND", "agent_id": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11" }
+
+This means the policy engine is failing at the agent lookup step, before it
+ever evaluates budget, merchant, or velocity rules.
+
+Please do the following, in order:
+
+1. Query the Supabase `agents` table directly and confirm whether a row with
+   id = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' actually exists.
+
+2. If it does NOT exist:
+   - Find where this agent ID is coming from (seed script, hardcoded test
+     constant, .env file, or the simulate/demo script).
+   - Check whether the seed script actually ran successfully against the
+     CURRENT Supabase project (not a different/old project or a different
+     .env file).
+   - Fix the seed script to run cleanly and print out the actual generated
+     agent ID after insertion, rather than assuming a hardcoded UUID.
+   - Update wherever the agent ID is referenced (demo scripts, simulate
+     script, tests) to pull the real ID dynamically instead of hardcoding it.
+
+3. If the row DOES exist:
+   - Inspect the exact Supabase query used in the agent lookup function
+     (likely in policyEngine.js or a db/service file).
+   - Check for: wrong table name, wrong column name, a .single() call that
+     throws when it shouldn't, a filter using the wrong field, or the
+     lookup silently catching an error and returning null without logging
+     the real underlying error.
+   - Add proper error logging at this lookup step so future failures show
+     the actual Postgres/Supabase error message, not just "not found."
+
+4. After fixing, re-run the full 3-act demo end to end and confirm the
+   audit_log now shows POLICY_EVALUATED events with real ALLOW/DENY
+   decisions based on budget/merchant/velocity — not AGENT_NOT_FOUND on
+   every request.
+
+5. Add a unit test that seeds a real agent, then confirms the policy engine
+   successfully finds and evaluates that agent, to catch this class of bug
+   automatically in future.
+
+--------------------------------------------------------
+BUG 2: Currency symbol (₹) is corrupted as "â‚¹" in stored/displayed data
+--------------------------------------------------------
+
+Symptom: In audit_log entries, the rupee symbol is showing up as garbled
+characters, e.g. "â‚¹12,000" instead of "₹12,000". This is a character
+encoding mismatch (likely UTF-8 bytes being read/written or displayed as
+Latin-1/Windows-1252 somewhere in the pipeline).
+
+Please do the following:
+
+1. Check the encoding of the source (wherever the buyer agent prompt strings
+   are generated — likely the simulate/demo script or the Gemini prompt
+   construction code). Confirm the file itself is saved as UTF-8.
+
+2. Check the Supabase client configuration and the Node.js HTTP
+   request/response handling — ensure Content-Type headers explicitly
+   specify charset=utf-8 wherever these strings are sent or received.
+
+3. Check the terminal/console output encoding if the corruption is only
+   visible when printed to console (this can be a display-only issue rather
+   than a stored-data issue — verify which one it is by checking the raw
+   bytes/value directly in the Supabase table editor, not just console logs).
+
+4. If the corruption is present in the actual stored database values (not
+   just console display), identify where the encoding conversion happens
+   and fix it at the source — do not patch it downstream with string
+   replacement hacks.
+
+5. After fixing, re-run a test request containing ₹ and confirm it is
+   stored and displayed correctly both in the Supabase table editor and in
+   the Next.js dashboard.
+
+--------------------------------------------------------
+FINAL STEP
+--------------------------------------------------------
+
+After both fixes, re-run the full 3-act demo cold (fresh terminal restart,
+fresh ngrok tunnel) and paste back the new audit_log output so we can verify
+both issues are resolved before moving on.

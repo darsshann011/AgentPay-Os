@@ -2,7 +2,7 @@
  * ============================================================================
  * AgentPay OS - Seed Demo Data Script (Step 10)
  * ============================================================================
- * Seeds the default "TravelBot Agent" with realistic operational parameters:
+ * Seeds or resets the "TravelBot Agent" in Supabase with baseline values:
  * - Total Budget: ₹50,000
  * - Allowed Whitelisted Merchants: ["Hotel Vendor A", "Cab Vendor B", "Insurance Vendor C"]
  * - Hourly Velocity Limit: 5 transactions / hour
@@ -14,8 +14,9 @@ const {
   isSupabaseConfigured,
   createAgent,
   DEFAULT_TRAVELBOT_ID,
-  resetMemoryStore,
-  getAgent
+  resetDatabaseState,
+  getAgent,
+  listAgents
 } = require('../src/db/supabaseClient');
 
 async function seedData() {
@@ -32,6 +33,8 @@ async function seedData() {
     velocity_limit: 5
   };
 
+  let activeAgent = null;
+
   if (isSupabaseConfigured && supabase) {
     try {
       console.log('[Seed] Upserting TravelBot Agent in Supabase Postgres...');
@@ -44,27 +47,39 @@ async function seedData() {
       if (error) {
         console.error('[Seed Error] Failed to seed Supabase:', error.message);
       } else {
-        console.log('✅ TravelBot Agent successfully seeded in Supabase:', data);
+        activeAgent = data;
+        console.log('✅ TravelBot Agent successfully seeded/updated in Supabase:');
+        console.log(JSON.stringify(data, null, 2));
       }
     } catch (err) {
-      console.error('[Seed Error]', err.message);
+      console.error('[Seed Exception]:', err.message);
     }
   } else {
-    resetMemoryStore();
-    const seeded = await getAgent(DEFAULT_TRAVELBOT_ID);
-    console.log('✅ TravelBot Agent successfully initialized in local store:', seeded);
+    await resetDatabaseState();
+    activeAgent = await getAgent(DEFAULT_TRAVELBOT_ID);
+    console.log('✅ TravelBot Agent successfully initialized in local store:', activeAgent);
+  }
+
+  if (!activeAgent) {
+    activeAgent = await getAgent(DEFAULT_TRAVELBOT_ID);
   }
 
   console.log('========================================================');
-  console.log('🎯 TravelBot ID:', DEFAULT_TRAVELBOT_ID);
-  console.log('💰 Budget:      ₹50,000');
-  console.log('🏢 Merchants:   Hotel Vendor A, Cab Vendor B, Insurance Vendor C');
-  console.log('⚡ Velocity:    5 transactions / hour');
-  console.log('========================================================');
+  console.log(`🎯 Active Agent ID: ${activeAgent?.id || DEFAULT_TRAVELBOT_ID}`);
+  console.log(`🤖 Agent Name:      ${activeAgent?.name || 'TravelBot Agent'}`);
+  console.log(`💰 Total Budget:    ₹${Number(activeAgent?.budget_total || 50000).toLocaleString('en-IN')}`);
+  console.log(`💵 Remaining:       ₹${Number(activeAgent?.budget_remaining || 50000).toLocaleString('en-IN')}`);
+  console.log(`🏢 Allowed Vendors: ${(activeAgent?.allowed_merchants || []).join(', ')}`);
+  console.log(`⚡ Velocity Limit:  ${activeAgent?.velocity_limit || 5} tx/hr`);
+  console.log('========================================================\n');
+  return activeAgent;
 }
 
 if (require.main === module) {
-  seedData().then(() => process.exit(0));
+  seedData().then(() => {
+    // Graceful exit
+    setTimeout(() => process.exit(0), 100);
+  });
 }
 
 module.exports = { seedData };

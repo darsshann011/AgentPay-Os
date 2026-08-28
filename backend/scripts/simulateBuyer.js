@@ -14,7 +14,6 @@ require('dotenv').config();
 
 const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:4000';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const DEFAULT_AGENT_ID = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11';
 
 let genAI = null;
 if (GEMINI_API_KEY && !GEMINI_API_KEY.includes('your_') && GEMINI_API_KEY.length > 10) {
@@ -23,6 +22,30 @@ if (GEMINI_API_KEY && !GEMINI_API_KEY.includes('your_') && GEMINI_API_KEY.length
   } catch (err) {
     // fallback
   }
+}
+
+/**
+ * Dynamically resolves the active agent ID from the backend
+ */
+async function getActiveAgentId() {
+  try {
+    const res = await fetch(`${BACKEND_URL}/api/audit/agents`, {
+      headers: { 'Accept': 'application/json; charset=utf-8' }
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.agents && data.agents.length > 0) {
+        const travelBot = data.agents.find(
+          (a) => a.id === 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' || a.name === 'TravelBot Agent'
+        );
+        if (travelBot) return travelBot.id;
+        return data.agents[0].id;
+      }
+    }
+  } catch (err) {
+    console.warn('[Simulate] Could not fetch agents list from backend, using default fallback ID.');
+  }
+  return 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11';
 }
 
 /**
@@ -73,9 +96,13 @@ Only return the prompt text without quotes.
 /**
  * Send request to AgentPay OS backend
  */
-async function sendBuyerRequest(prompt, idempotencyKey, agentId = DEFAULT_AGENT_ID) {
+async function sendBuyerRequest(prompt, idempotencyKey, explicitAgentId) {
+  const agentId = explicitAgentId || (await getActiveAgentId());
   const url = `${BACKEND_URL}/api/agent-requests`;
-  const headers = { 'Content-Type': 'application/json' };
+  const headers = {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Accept': 'application/json; charset=utf-8'
+  };
   if (idempotencyKey) {
     headers['Idempotency-Key'] = idempotencyKey;
   }
@@ -117,7 +144,7 @@ async function sendSimulatedWebhook(orderId, transactionId) {
   const response = await fetch(url, {
     method: 'POST',
     headers: {
-      'Content-Type': 'application/json',
+      'Content-Type': 'application/json; charset=utf-8',
       'X-Razorpay-Signature': 'test_valid_signature'
     },
     body: JSON.stringify(payload)
@@ -130,7 +157,7 @@ async function sendSimulatedWebhook(orderId, transactionId) {
 // 3-ACT DEMO RUNNERS
 // ---------------------------------------------------------------------------
 
-async function runAct1_HappyPath() {
+async function runAct1_HappyPath(agentId) {
   console.log('\n========================================================');
   console.log('🎬 ACT 1: HAPPY PATH (Allowed Purchase & Payment Creation)');
   console.log('========================================================');
@@ -140,7 +167,7 @@ async function runAct1_HappyPath() {
   const idempotencyKey = `ik_act1_${uuidv4().substring(0, 8)}`;
   console.log(`🔑 Idempotency Key: ${idempotencyKey}`);
 
-  const response = await sendBuyerRequest(prompt, idempotencyKey);
+  const response = await sendBuyerRequest(prompt, idempotencyKey, agentId);
   console.log('🛡️ AgentPay OS Response:', JSON.stringify(response, null, 2));
 
   if (response.decision === 'ALLOW' && response.razorpay?.id) {
@@ -149,9 +176,10 @@ async function runAct1_HappyPath() {
     const webhookRes = await sendSimulatedWebhook(response.razorpay.id, response.transaction_id);
     console.log('✅ Webhook Response:', webhookRes);
   }
+  return response;
 }
 
-async function runAct2_BlockedPath() {
+async function runAct2_BlockedPath(agentId) {
   console.log('\n========================================================');
   console.log('🎬 ACT 2: BLOCKED PATH (Budget Exceeded Denial)');
   console.log('========================================================');
@@ -159,12 +187,13 @@ async function runAct2_BlockedPath() {
   console.log(`🤖 AI Buyer Agent prompt: "${prompt}"`);
 
   const idempotencyKey = `ik_act2_${uuidv4().substring(0, 8)}`;
-  const response = await sendBuyerRequest(prompt, idempotencyKey);
+  const response = await sendBuyerRequest(prompt, idempotencyKey, agentId);
   console.log('🛡️ AgentPay OS Response:', JSON.stringify(response, null, 2));
   console.log('🔒 Verification: Policy Engine denied before Razorpay call was ever made.');
+  return response;
 }
 
-async function runAct3_DuplicateRacePath() {
+async function runAct3_DuplicateRacePath(agentId) {
   console.log('\n========================================================');
   console.log('🎬 ACT 3: DUPLICATE / RACE PATH (Double-Spend & Replay Blocked)');
   console.log('========================================================');
@@ -172,32 +201,36 @@ async function runAct3_DuplicateRacePath() {
   const sharedKey = `ik_duplicate_replay_${uuidv4().substring(0, 8)}`;
 
   console.log(`🤖 Firing Request 1 with Key: ${sharedKey}`);
-  const res1 = await sendBuyerRequest(prompt, sharedKey);
+  const res1 = await sendBuyerRequest(prompt, sharedKey, agentId);
   console.log('🛡️ Request 1 Result:', res1.decision || res1.status);
 
   console.log(`🤖 Firing Request 2 (Duplicate / Delayed Retry) with Same Key: ${sharedKey}`);
-  const res2 = await sendBuyerRequest(prompt, sharedKey);
+  const res2 = await sendBuyerRequest(prompt, sharedKey, agentId);
   console.log('🛡️ Request 2 Result:', JSON.stringify(res2, null, 2));
   console.log('🔒 Verification: Duplicate request intercepted and DUPLICATE_BLOCKED logged.');
+  return { res1, res2 };
 }
 
 async function main() {
   const arg = process.argv[2] || '--all';
   console.log(`🚀 Starting Simulated AI Buyer Agent Demo [Mode: ${arg}]`);
 
+  const agentId = await getActiveAgentId();
+  console.log(`📍 Targeting Active Agent ID: ${agentId}`);
+
   try {
     if (arg === '--act=1' || arg === '1') {
-      await runAct1_HappyPath();
+      await runAct1_HappyPath(agentId);
     } else if (arg === '--act=2' || arg === '2') {
-      await runAct2_BlockedPath();
+      await runAct2_BlockedPath(agentId);
     } else if (arg === '--act=3' || arg === '3') {
-      await runAct3_DuplicateRacePath();
+      await runAct3_DuplicateRacePath(agentId);
     } else {
-      await runAct1_HappyPath();
-      await new Promise(r => setTimeout(r, 1000));
-      await runAct2_BlockedPath();
-      await new Promise(r => setTimeout(r, 1000));
-      await runAct3_DuplicateRacePath();
+      await runAct1_HappyPath(agentId);
+      await new Promise(r => setTimeout(r, 1200));
+      await runAct2_BlockedPath(agentId);
+      await new Promise(r => setTimeout(r, 1200));
+      await runAct3_DuplicateRacePath(agentId);
     }
     console.log('\n✨ Demo Sequence Completed Successfully!');
   } catch (err) {
@@ -206,10 +239,13 @@ async function main() {
 }
 
 if (require.main === module) {
-  main();
+  main().then(() => {
+    setTimeout(() => process.exit(0), 100);
+  });
 }
 
 module.exports = {
+  getActiveAgentId,
   generateBuyerPrompt,
   sendBuyerRequest,
   runAct1_HappyPath,

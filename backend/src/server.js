@@ -10,6 +10,12 @@ const auditRouter = require('./routes/audit');
 const app = express();
 const PORT = process.env.PORT || 4000;
 
+// Set UTF-8 encoding across all HTTP responses
+app.use((req, res, next) => {
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  next();
+});
+
 // Middleware
 app.use(cors({
   origin: '*',
@@ -17,7 +23,7 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Razorpay-Signature', 'Idempotency-Key']
 }));
 
-// Capture raw body for Razorpay webhook HMAC signature verification
+// Capture raw body for Razorpay webhook HMAC signature verification with explicit UTF-8 support
 app.use(express.json({
   verify: (req, res, buf) => {
     req.rawBody = buf;

@@ -36,8 +36,9 @@ const memoryStore = {
   agentLocks: new Map(), // Mutex locks per agent ID
 };
 
-// Seed default TravelBot agent in memory store for instant test readiness
 const DEFAULT_TRAVELBOT_ID = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11';
+
+// Seed default TravelBot agent in memory store for instant test readiness
 memoryStore.agents.set(DEFAULT_TRAVELBOT_ID, {
   id: DEFAULT_TRAVELBOT_ID,
   name: 'TravelBot Agent',
@@ -65,25 +66,104 @@ async function acquireAgentLock(agentId) {
 
 async function getAgent(agentId) {
   if (supabase) {
-    const { data, error } = await supabase
-      .from('agents')
-      .select('*')
-      .eq('id', agentId)
-      .single();
-    if (error) return null;
-    return data;
+    try {
+      // 1. If explicit agentId is supplied, lookup by ID
+      if (agentId) {
+        const { data, error } = await supabase
+          .from('agents')
+          .select('*')
+          .eq('id', agentId)
+          .maybeSingle();
+
+        if (error) {
+          console.error(`[Supabase Error in getAgent('${agentId}')]:`, error.message, error.details || '');
+        }
+
+        if (data) return data;
+      }
+
+      // 2. If no agentId or agent with that ID wasn't found, look for TravelBot Agent
+      const { data: travelBot, error: tbErr } = await supabase
+        .from('agents')
+        .select('*')
+        .eq('id', DEFAULT_TRAVELBOT_ID)
+        .maybeSingle();
+
+      if (travelBot) return travelBot;
+
+      // 3. Otherwise find the first available agent
+      const { data: firstAgent, error: listErr } = await supabase
+        .from('agents')
+        .select('*')
+        .eq('name', 'TravelBot Agent')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (firstAgent) return firstAgent;
+
+      // 3. If agents table is completely empty, auto-seed default TravelBot agent into Supabase
+      console.log('[Supabase] Agents table is empty. Auto-seeding default TravelBot Agent...');
+      const defaultAgent = {
+        id: agentId || DEFAULT_TRAVELBOT_ID,
+        name: 'TravelBot Agent',
+        budget_total: 50000,
+        budget_remaining: 50000,
+        allowed_merchants: ['Hotel Vendor A', 'Cab Vendor B', 'Insurance Vendor C'],
+        velocity_limit: 5
+      };
+
+      const { data: seededAgent, error: seedErr } = await supabase
+        .from('agents')
+        .upsert(defaultAgent)
+        .select()
+        .single();
+
+      if (seedErr) {
+        console.error('[Supabase Auto-Seed Error]:', seedErr.message);
+        return defaultAgent;
+      }
+
+      return seededAgent;
+    } catch (err) {
+      console.error('[Supabase getAgent Exception]:', err.message);
+    }
   }
-  return memoryStore.agents.get(agentId) || null;
+
+  return (
+    (agentId && memoryStore.agents.get(agentId)) ||
+    Array.from(memoryStore.agents.values())[0] ||
+    null
+  );
 }
 
 async function listAgents() {
   if (supabase) {
-    const { data, error } = await supabase
-      .from('agents')
-      .select('*')
-      .order('created_at', { ascending: false });
-    if (error) throw error;
-    return data;
+    try {
+      const { data, error } = await supabase
+        .from('agents')
+        .select('*')
+        .order('created_at', { ascending: false });
+
+      if (error) {
+        console.error('[Supabase Error in listAgents]:', error.message);
+      }
+
+      if (data && data.length > 0) {
+        // Place TravelBot at index 0
+        return data.sort((a, b) => {
+          if (a.id === DEFAULT_TRAVELBOT_ID || a.name === 'TravelBot Agent') return -1;
+          if (b.id === DEFAULT_TRAVELBOT_ID || b.name === 'TravelBot Agent') return 1;
+          return 0;
+        });
+      }
+
+      // If empty, auto-seed and return
+      const agent = await getAgent(DEFAULT_TRAVELBOT_ID);
+      return agent ? [agent] : [];
+    } catch (err) {
+      console.error('[Supabase listAgents Exception]:', err.message);
+    }
   }
   return Array.from(memoryStore.agents.values());
 }
@@ -106,7 +186,10 @@ async function createAgent(agentData) {
       .insert(agent)
       .select()
       .single();
-    if (error) throw error;
+    if (error) {
+      console.error('[Supabase Error in createAgent]:', error.message);
+      throw error;
+    }
     return data;
   }
 
@@ -122,7 +205,10 @@ async function updateAgent(agentId, updates) {
       .eq('id', agentId)
       .select()
       .single();
-    if (error) throw error;
+    if (error) {
+      console.error('[Supabase Error in updateAgent]:', error.message);
+      throw error;
+    }
     return data;
   }
 
@@ -139,8 +225,11 @@ async function getTransaction(txId) {
       .from('transactions')
       .select('*')
       .eq('id', txId)
-      .single();
-    if (error) return null;
+      .maybeSingle();
+    if (error) {
+      console.error(`[Supabase Error in getTransaction('${txId}')]:`, error.message);
+      return null;
+    }
     return data;
   }
   return memoryStore.transactions.get(txId) || null;
@@ -154,7 +243,10 @@ async function getTransactionByIdempotencyKey(key) {
       .select('*')
       .eq('idempotency_key', key)
       .maybeSingle();
-    if (error) return null;
+    if (error) {
+      console.error(`[Supabase Error in getTransactionByIdempotencyKey('${key}')]:`, error.message);
+      return null;
+    }
     return data;
   }
   for (const tx of memoryStore.transactions.values()) {
@@ -184,7 +276,10 @@ async function createTransaction(txData) {
       .insert(tx)
       .select()
       .single();
-    if (error) throw error;
+    if (error) {
+      console.error('[Supabase Error in createTransaction]:', error.message);
+      throw error;
+    }
     return data;
   }
 
@@ -205,7 +300,10 @@ async function updateTransaction(txId, updates) {
       .eq('id', txId)
       .select()
       .single();
-    if (error) throw error;
+    if (error) {
+      console.error('[Supabase Error in updateTransaction]:', error.message);
+      throw error;
+    }
     return data;
   }
 
@@ -219,7 +317,7 @@ async function updateTransaction(txId, updates) {
 async function addAuditLog(transactionId, eventType, detail = {}) {
   const logEntry = {
     id: uuidv4(),
-    transaction_id: transactionId,
+    transaction_id: transactionId || null,
     event_type: eventType,
     detail,
     created_at: new Date().toISOString()
@@ -243,32 +341,39 @@ async function addAuditLog(transactionId, eventType, detail = {}) {
 
 async function getAuditLogs(limit = 100) {
   if (supabase) {
-    const { data, error } = await supabase
-      .from('audit_log')
-      .select(`
-        id,
-        transaction_id,
-        event_type,
-        detail,
-        created_at,
-        transactions (
+    try {
+      const { data, error } = await supabase
+        .from('audit_log')
+        .select(`
           id,
-          agent_id,
-          amount,
-          merchant,
-          status,
-          razorpay_order_id,
-          reason,
-          agents (
+          transaction_id,
+          event_type,
+          detail,
+          created_at,
+          transactions (
             id,
-            name
+            agent_id,
+            amount,
+            merchant,
+            status,
+            razorpay_order_id,
+            reason,
+            agents (
+              id,
+              name
+            )
           )
-        )
-      `)
-      .order('created_at', { ascending: false })
-      .limit(limit);
+        `)
+        .order('created_at', { ascending: false })
+        .limit(limit);
 
-    if (!error && data) return data;
+      if (!error && data) return data;
+      if (error) {
+        console.error('[Supabase Error in getAuditLogs]:', error.message);
+      }
+    } catch (err) {
+      console.error('[Supabase getAuditLogs Exception]:', err.message);
+    }
   }
 
   // Format memory store logs with joined transaction and agent info
@@ -302,6 +407,9 @@ async function processAtomicBudgetDeduction(agentId, amount, merchant, idempoten
       if (!error && data) {
         return data;
       }
+      if (error) {
+        console.warn('[Supabase RPC Error / Fallback]:', error.message);
+      }
     } catch (err) {
       console.warn('[Supabase RPC] Falling back to atomic locked JS execution:', err.message);
     }
@@ -322,15 +430,32 @@ async function processAtomicBudgetDeduction(agentId, amount, merchant, idempoten
     // 1. Calculate velocity count in last 1 hour
     const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
     let recentTxCount = 0;
-    for (const tx of memoryStore.transactions.values()) {
-      if (tx.agent_id === agentId && tx.created_at >= oneHourAgo && ['PENDING', 'ALLOWED', 'SUCCESS'].includes(tx.status)) {
-        recentTxCount++;
+
+    if (supabase) {
+      try {
+        const { count, error: countErr } = await supabase
+          .from('transactions')
+          .select('*', { count: 'exact', head: true })
+          .eq('agent_id', agent.id)
+          .gte('created_at', oneHourAgo)
+          .in('status', ['PENDING', 'ALLOWED', 'SUCCESS']);
+        if (!countErr && typeof count === 'number') {
+          recentTxCount = count;
+        }
+      } catch (e) {
+        // continue with 0
+      }
+    } else {
+      for (const tx of memoryStore.transactions.values()) {
+        if (tx.agent_id === agent.id && tx.created_at >= oneHourAgo && ['PENDING', 'ALLOWED', 'SUCCESS'].includes(tx.status)) {
+          recentTxCount++;
+        }
       }
     }
 
     if (recentTxCount >= agent.velocity_limit) {
       const tx = await createTransaction({
-        agent_id: agentId,
+        agent_id: agent.id,
         amount,
         merchant,
         idempotency_key: idempotencyKey,
@@ -349,7 +474,7 @@ async function processAtomicBudgetDeduction(agentId, amount, merchant, idempoten
     // 2. Merchant check
     if (!agent.allowed_merchants.includes(merchant)) {
       const tx = await createTransaction({
-        agent_id: agentId,
+        agent_id: agent.id,
         amount,
         merchant,
         idempotency_key: idempotencyKey,
@@ -366,9 +491,9 @@ async function processAtomicBudgetDeduction(agentId, amount, merchant, idempoten
     }
 
     // 3. Budget check
-    if (agent.budget_remaining < amount) {
+    if (Number(agent.budget_remaining) < Number(amount)) {
       const tx = await createTransaction({
-        agent_id: agentId,
+        agent_id: agent.id,
         amount,
         merchant,
         idempotency_key: idempotencyKey,
@@ -391,10 +516,10 @@ async function processAtomicBudgetDeduction(agentId, amount, merchant, idempoten
 
     // 4. Deduct budget atomically
     const newBudgetRemaining = Number(agent.budget_remaining) - Number(amount);
-    await updateAgent(agentId, { budget_remaining: newBudgetRemaining });
+    await updateAgent(agent.id, { budget_remaining: newBudgetRemaining });
 
     const tx = await createTransaction({
-      agent_id: agentId,
+      agent_id: agent.id,
       amount,
       merchant,
       idempotency_key: idempotencyKey,
@@ -419,7 +544,25 @@ async function processAtomicBudgetDeduction(agentId, amount, merchant, idempoten
   }
 }
 
-function resetMemoryStore() {
+async function resetDatabaseState() {
+  if (supabase) {
+    try {
+      console.log('[Supabase] Resetting TravelBot agent baseline (₹50,000 budget, all vendors)...');
+      await supabase
+        .from('agents')
+        .upsert({
+          id: DEFAULT_TRAVELBOT_ID,
+          name: 'TravelBot Agent',
+          budget_total: 50000,
+          budget_remaining: 50000,
+          allowed_merchants: ['Hotel Vendor A', 'Cab Vendor B', 'Insurance Vendor C'],
+          velocity_limit: 5
+        });
+    } catch (e) {
+      console.error('[Supabase Reset Error]:', e.message);
+    }
+  }
+
   memoryStore.agents.clear();
   memoryStore.transactions.clear();
   memoryStore.audit_log = [];
@@ -450,5 +593,6 @@ module.exports = {
   addAuditLog,
   getAuditLogs,
   processAtomicBudgetDeduction,
-  resetMemoryStore
+  resetDatabaseState,
+  resetMemoryStore: resetDatabaseState
 };

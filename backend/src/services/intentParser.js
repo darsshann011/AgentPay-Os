@@ -129,41 +129,43 @@ async function parseIntent(promptText) {
   }
 
   if (genAI) {
-    try {
-      const model = genAI.getGenerativeModel({
-        model: 'gemini-1.5-flash',
-        systemInstruction: SYSTEM_INSTRUCTION
-      });
+    const candidateModels = ['gemini-2.0-flash', 'gemini-1.5-flash-latest', 'gemini-1.5-pro', 'gemini-pro'];
 
-      const result = await model.generateContent({
-        contents: [
-          {
-            role: 'user',
-            parts: [{ text: `Extract the purchase intent for this request:\n"${promptText}"` }]
+    for (const modelName of candidateModels) {
+      try {
+        const model = genAI.getGenerativeModel({
+          model: modelName,
+          systemInstruction: SYSTEM_INSTRUCTION
+        });
+
+        const result = await model.generateContent({
+          contents: [
+            {
+              role: 'user',
+              parts: [{ text: `Extract the purchase intent for this request:\n"${promptText}"` }]
+            }
+          ],
+          generationConfig: {
+            temperature: 0.1
           }
-        ],
-        generationConfig: {
-          temperature: 0.1,
-          responseMimeType: 'application/json'
-        }
-      });
+        });
 
-      const rawResponse = result.response.text();
-      // Clean any accidental markdown code blocks
-      const cleanJson = rawResponse.replace(/```json/gi, '').replace(/```/g, '').trim();
-      const parsed = JSON.parse(cleanJson);
+        const rawResponse = result.response.text();
+        const cleanJson = rawResponse.replace(/```json/gi, '').replace(/```/g, '').trim();
+        const parsed = JSON.parse(cleanJson);
 
-      return {
-        action: parsed.action || 'PURCHASE',
-        sku: parsed.sku || 'ITEM-DEFAULT',
-        amount: Number(parsed.amount) || 0,
-        merchant: parsed.merchant || 'Unknown Merchant',
-        quantity: Number(parsed.quantity) || 1,
-        reason: parsed.reason || promptText.slice(0, 100),
-        confidence: Number(parsed.confidence) || 0.95
-      };
-    } catch (err) {
-      console.warn('[Gemini] Fallback to heuristic intent parser due to:', err.message);
+        return {
+          action: parsed.action || 'PURCHASE',
+          sku: parsed.sku || 'ITEM-DEFAULT',
+          amount: Number(parsed.amount) || 0,
+          merchant: parsed.merchant || 'Unknown Merchant',
+          quantity: Number(parsed.quantity) || 1,
+          reason: parsed.reason || promptText.slice(0, 100),
+          confidence: Number(parsed.confidence) || 0.95
+        };
+      } catch (err) {
+        // Try next candidate model
+      }
     }
   }
 
