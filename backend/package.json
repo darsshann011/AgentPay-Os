@@ -1,0 +1,33 @@
+{
+  "name": "agentpay-os-backend",
+  "version": "1.0.0",
+  "description": "AgentPay OS - Policy firewall for agentic commerce",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test test/**/*.test.js",
+    "seed": "node scripts/seed.js",
+    "simulate": "node scripts/simulateBuyer.js"
+  },
+  "keywords": [
+    "agentic-commerce",
+    "ai-agents",
+    "policy-engine",
+    "razorpay",
+    "supabase",
+    "gemini"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@google/generative-ai": "^0.24.0",
+    "@supabase/supabase-js": "^2.49.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "morgan": "^1.10.0",
+    "razorpay": "^2.9.5",
+    "uuid": "^11.1.0"
+  }
+}
