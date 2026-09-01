@@ -21,7 +21,12 @@ import {
   ExternalLink,
   ChevronRight,
   Building,
-  Activity
+  Activity,
+  Key,
+  FileCheck,
+  Lock,
+  Copy,
+  Check
 } from 'lucide-react';
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:4000';
@@ -29,6 +34,7 @@ const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:400
 export default function AgentPayDashboard() {
   const [logs, setLogs] = useState([]);
   const [agents, setAgents] = useState([]);
+  const [activeMandate, setActiveMandate] = useState(null);
   const [summary, setSummary] = useState({
     totalRequested: 0,
     totalAllowed: 0,
@@ -45,6 +51,18 @@ export default function AgentPayDashboard() {
   const [customPrompt, setCustomPrompt] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [demoActionStatus, setDemoActionStatus] = useState(null);
+  const [now, setNow] = useState(Date.now());
+  const [copiedMandateId, setCopiedMandateId] = useState(false);
+
+  // Audit Chain Verification State
+  const [isVerifyingChain, setIsVerifyingChain] = useState(false);
+  const [chainVerificationResult, setChainVerificationResult] = useState(null);
+
+  // Keep a 1-second interval ticking for the live countdown
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
 
   // Fetch Live Data from Backend
   const fetchData = useCallback(async () => {
@@ -55,6 +73,8 @@ export default function AgentPayDashboard() {
         fetch(`${BACKEND_URL}/api/audit/summary`).catch(() => null)
       ]);
 
+      let currentAgentId = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11';
+
       if (logsRes && logsRes.ok) {
         const data = await logsRes.json();
         if (data.logs) setLogs(data.logs);
@@ -62,12 +82,22 @@ export default function AgentPayDashboard() {
 
       if (agentsRes && agentsRes.ok) {
         const data = await agentsRes.json();
-        if (data.agents) setAgents(data.agents);
+        if (data.agents && data.agents.length > 0) {
+          setAgents(data.agents);
+          currentAgentId = data.agents[0].id || currentAgentId;
+        }
       }
 
       if (summaryRes && summaryRes.ok) {
         const data = await summaryRes.json();
         if (data.summary) setSummary(data.summary);
+      }
+
+      // Fetch Active Mandate for the active demo agent
+      const mandateRes = await fetch(`${BACKEND_URL}/api/mandates/${currentAgentId}/active`).catch(() => null);
+      if (mandateRes && mandateRes.ok) {
+        const mandateData = await mandateRes.json();
+        setActiveMandate(mandateData.mandate || null);
       }
     } catch (err) {
       console.error('Failed to poll dashboard data:', err);
@@ -80,6 +110,24 @@ export default function AgentPayDashboard() {
     const interval = setInterval(fetchData, 2500);
     return () => clearInterval(interval);
   }, [fetchData, isAutoPolling]);
+
+  // Verify Audit Chain Action
+  const handleVerifyAuditChain = async () => {
+    setIsVerifyingChain(true);
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/audit/verify-chain`);
+      const result = await res.json();
+      setChainVerificationResult(result);
+    } catch (err) {
+      setChainVerificationResult({
+        valid: false,
+        reason: 'NETWORK_ERROR',
+        message: err.message
+      });
+    } finally {
+      setIsVerifyingChain(false);
+    }
+  };
 
   // Demo Act Triggers
   const triggerDemoAct = async (actNumber) => {
@@ -195,19 +243,41 @@ export default function AgentPayDashboard() {
     if (!confirm('Reset demo baseline and restore ₹50,000 budget?')) return;
     try {
       await fetch(`${BACKEND_URL}/api/audit/reset`, { method: 'POST' });
+      setChainVerificationResult(null);
       await fetchData();
     } catch (err) {
       console.error(err);
     }
   };
 
+  // Helper for live mandate countdown
+  const getMandateExpiryCountdown = (expiresAt) => {
+    if (!expiresAt) return 'N/A';
+    const expiryTime = new Date(expiresAt).getTime();
+    const diff = expiryTime - now;
+
+    if (diff <= 0) {
+      return { text: 'EXPIRED', isExpired: true };
+    }
+
+    const totalSecs = Math.floor(diff / 1000);
+    const hours = Math.floor(totalSecs / 3600);
+    const mins = Math.floor((totalSecs % 3600) / 60);
+    const secs = totalSecs % 60;
+
+    if (hours > 0) {
+      return { text: `${hours}h ${mins}m ${secs}s left`, isExpired: false };
+    }
+    return { text: `${mins}m ${secs}s left`, isExpired: false };
+  };
+
   // Filtered logs
   const filteredLogs = logs.filter((log) => {
     if (activeTab === 'allowed') {
-      return log.event_type === 'POLICY_EVALUATED' || log.event_type === 'PAYMENT_CREATED';
+      return log.event_type === 'POLICY_EVALUATED' || log.event_type === 'PAYMENT_CREATED' || log.event_type === 'CAPTURED' || log.event_type === 'AUTHORIZED';
     }
     if (activeTab === 'denied') {
-      return log.event_type === 'DENIED';
+      return log.event_type === 'DENIED' || log.event_type === 'MANDATE_DENIED' || log.event_type === 'VOIDED';
     }
     if (activeTab === 'blocked') {
       return log.event_type === 'DUPLICATE_BLOCKED';
@@ -226,6 +296,16 @@ export default function AgentPayDashboard() {
   const budgetRemaining = Number(activeAgent.budget_remaining || 0);
   const budgetTotal = Number(activeAgent.budget_total || 50000);
   const budgetPercent = Math.max(0, Math.min(100, Math.round((budgetRemaining / budgetTotal) * 100)));
+
+  // Computed status for current active mandate
+  const countdown = activeMandate ? getMandateExpiryCountdown(activeMandate.expires_at) : null;
+  const computedMandateStatus = activeMandate
+    ? (activeMandate.status === 'USED' || activeMandate.nonce_used
+        ? 'USED'
+        : countdown?.isExpired
+          ? 'EXPIRED'
+          : activeMandate.status || 'ACTIVE')
+    : null;
 
   return (
     <div style={{ maxWidth: '1440px', margin: '0 auto', padding: '24px 20px 60px' }}>
@@ -248,11 +328,11 @@ export default function AgentPayDashboard() {
               <h1 style={{ fontSize: '1.6rem', fontWeight: 800, letterSpacing: '-0.02em' }}>AgentPay OS</h1>
               <span className="badge badge-allow" style={{ fontSize: '0.7rem' }}>
                 <span className="pulse-dot" style={{ backgroundColor: '#10b981' }} />
-                FIREWALL ACTIVE
+                FIREWALL & TRUST RAIL ACTIVE
               </span>
             </div>
             <p style={{ color: 'var(--text-muted)', fontSize: '0.875rem', marginTop: '2px' }}>
-              Deterministic Policy Firewall & Razorpay Gateway for Autonomous AI Buyer Agents
+              Deterministic Policy Firewall, Hardware WebAuthn Mandates & Tamper-Evident Ledger
             </p>
           </div>
         </div>
@@ -315,7 +395,7 @@ export default function AgentPayDashboard() {
         {/* Metric 2 */}
         <div className="glass-panel glow-emerald" style={{ padding: '18px 20px' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', color: 'var(--text-muted)', fontSize: '0.85rem' }}>
-            <span>Approved & Paid</span>
+            <span>Approved & Captured</span>
             <CheckCircle2 size={16} color="#10b981" />
           </div>
           <div style={{ fontSize: '1.8rem', fontWeight: 700, marginTop: '8px', color: '#34d399' }}>
@@ -329,14 +409,14 @@ export default function AgentPayDashboard() {
         {/* Metric 3 */}
         <div className="glass-panel" style={{ padding: '18px 20px' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', color: 'var(--text-muted)', fontSize: '0.85rem' }}>
-            <span>Policy Violations Denied</span>
+            <span>Policy & Mandate Denials</span>
             <ShieldAlert size={16} color="#f43f5e" />
           </div>
           <div style={{ fontSize: '1.8rem', fontWeight: 700, marginTop: '8px', color: '#fb7185' }}>
             {summary.totalDenied}
           </div>
           <div style={{ color: 'var(--text-muted)', fontSize: '0.75rem', marginTop: '4px' }}>
-            Exceeded budget or unlisted vendor
+            Bound violations or price-drifts
           </div>
         </div>
 
@@ -350,71 +430,78 @@ export default function AgentPayDashboard() {
             {summary.totalBlockedDuplicates}
           </div>
           <div style={{ color: 'var(--text-muted)', fontSize: '0.75rem', marginTop: '4px' }}>
-            Idempotency & race protection
+            Atomic nonce & idempotency locks
           </div>
         </div>
       </div>
 
       {/* -------------------------------------------------------------------- */}
-      {/* MIDDLE SECTION: AGENT CARD & INTERACTIVE 3-ACT DEMO CONTROLLER */}
+      {/* MIDDLE SECTION: AGENT CARD + MANDATE STATUS + 3-ACT DEMO CONTROLLER */}
       {/* -------------------------------------------------------------------- */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1.6fr', gap: '20px', marginBottom: '28px' }}>
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))',
+        gap: '20px',
+        marginBottom: '28px'
+      }}>
         
-        {/* Active Agent Profile Card */}
-        <div className="glass-panel" style={{ padding: '22px' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-              <div style={{ background: 'rgba(99, 102, 241, 0.2)', padding: '8px', borderRadius: '10px' }}>
-                <Building size={20} color="#818cf8" />
+        {/* 1. Active Agent Profile Card */}
+        <div className="glass-panel" style={{ padding: '22px', display: 'flex', flexDirection: 'column', justifyContent: 'space-between' }}>
+          <div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                <div style={{ background: 'rgba(99, 102, 241, 0.2)', padding: '8px', borderRadius: '10px' }}>
+                  <Building size={20} color="#818cf8" />
+                </div>
+                <div>
+                  <h3 style={{ fontSize: '1.05rem', fontWeight: 700 }}>{activeAgent.name}</h3>
+                  <span className="mono" style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                    ID: {activeAgent.id ? `${activeAgent.id.substring(0, 13)}...` : 'Default'}
+                  </span>
+                </div>
               </div>
-              <div>
-                <h3 style={{ fontSize: '1.05rem', fontWeight: 700 }}>{activeAgent.name}</h3>
-                <span className="mono" style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
-                  ID: {activeAgent.id ? `${activeAgent.id.substring(0, 13)}...` : 'Default'}
+              <button onClick={handleReset} className="btn-secondary" style={{ fontSize: '0.75rem', padding: '5px 10px' }}>
+                <RotateCcw size={12} /> Reset
+              </button>
+            </div>
+
+            {/* Budget Gauge */}
+            <div style={{ marginBottom: '18px' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px', fontSize: '0.85rem' }}>
+                <span style={{ color: 'var(--text-muted)' }}>Budget Remaining</span>
+                <span className="mono" style={{ fontWeight: 700, color: budgetRemaining < 10000 ? '#fb7185' : '#34d399' }}>
+                  ₹{budgetRemaining.toLocaleString('en-IN')} / ₹{budgetTotal.toLocaleString('en-IN')}
                 </span>
               </div>
+              <div style={{ width: '100%', height: '10px', background: 'rgba(255,255,255,0.06)', borderRadius: '9999px', overflow: 'hidden' }}>
+                <div style={{
+                  width: `${budgetPercent}%`,
+                  height: '100%',
+                  background: budgetPercent < 25 ? '#f43f5e' : budgetPercent < 60 ? '#f59e0b' : 'linear-gradient(90deg, #6366f1, #10b981)',
+                  transition: 'width 0.5s ease-in-out'
+                }} />
+              </div>
             </div>
-            <button onClick={handleReset} className="btn-secondary" style={{ fontSize: '0.75rem', padding: '5px 10px' }}>
-              <RotateCcw size={12} /> Reset
-            </button>
-          </div>
 
-          {/* Budget Gauge */}
-          <div style={{ marginBottom: '18px' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px', fontSize: '0.85rem' }}>
-              <span style={{ color: 'var(--text-muted)' }}>Budget Remaining</span>
-              <span className="mono" style={{ fontWeight: 700, color: budgetRemaining < 10000 ? '#fb7185' : '#34d399' }}>
-                ₹{budgetRemaining.toLocaleString('en-IN')} / ₹{budgetTotal.toLocaleString('en-IN')}
-              </span>
-            </div>
-            <div style={{ width: '100%', height: '10px', background: 'rgba(255,255,255,0.06)', borderRadius: '9999px', overflow: 'hidden' }}>
-              <div style={{
-                width: `${budgetPercent}%`,
-                height: '100%',
-                background: budgetPercent < 25 ? '#f43f5e' : budgetPercent < 60 ? '#f59e0b' : 'linear-gradient(90deg, #6366f1, #10b981)',
-                transition: 'width 0.5s ease-in-out'
-              }} />
-            </div>
-          </div>
-
-          {/* Whitelisted Merchants */}
-          <div style={{ marginBottom: '14px' }}>
-            <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-              Whitelisted Merchants
-            </div>
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
-              {activeAgent.allowed_merchants?.map((m, idx) => (
-                <span key={idx} style={{
-                  fontSize: '0.75rem',
-                  padding: '3px 8px',
-                  borderRadius: '6px',
-                  background: 'rgba(255,255,255,0.05)',
-                  border: '1px solid var(--border-subtle)',
-                  color: 'var(--text-primary)'
-                }}>
-                  ✓ {m}
-                </span>
-              ))}
+            {/* Whitelisted Merchants */}
+            <div style={{ marginBottom: '14px' }}>
+              <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                Whitelisted Merchants
+              </div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
+                {activeAgent.allowed_merchants?.map((m, idx) => (
+                  <span key={idx} style={{
+                    fontSize: '0.75rem',
+                    padding: '3px 8px',
+                    borderRadius: '6px',
+                    background: 'rgba(255,255,255,0.05)',
+                    border: '1px solid var(--border-subtle)',
+                    color: 'var(--text-primary)'
+                  }}>
+                    ✓ {m}
+                  </span>
+                ))}
+              </div>
             </div>
           </div>
 
@@ -425,94 +512,215 @@ export default function AgentPayDashboard() {
           </div>
         </div>
 
-        {/* 3-Act Demo Controller & Interactive Sandbox */}
-        <div className="glass-panel" style={{ padding: '22px' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '14px' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <Sparkles size={18} color="#38bdf8" />
-              <h3 style={{ fontSize: '1.05rem', fontWeight: 700 }}>Live Demo Controller & Sandbox</h3>
+        {/* 2. Hardware Mandate Status Panel (Trust Rail) */}
+        <div className="glass-panel" style={{ padding: '22px', display: 'flex', flexDirection: 'column', justifyContent: 'space-between' }}>
+          <div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                <div style={{ background: 'rgba(56, 189, 248, 0.2)', padding: '8px', borderRadius: '10px' }}>
+                  <Key size={20} color="#38bdf8" />
+                </div>
+                <div>
+                  <h3 style={{ fontSize: '1.05rem', fontWeight: 700 }}>Mandate Trust Rail</h3>
+                  <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                    WebAuthn Hardware Bound Authorization
+                  </span>
+                </div>
+              </div>
+
+              {computedMandateStatus && (
+                <span className={`badge ${
+                  computedMandateStatus === 'ACTIVE'
+                    ? 'badge-allow glow-emerald'
+                    : computedMandateStatus === 'USED'
+                      ? 'badge-agent'
+                      : 'badge-deny glow-rose'
+                }`} style={{ fontSize: '0.75rem' }}>
+                  {computedMandateStatus === 'ACTIVE' && <span className="pulse-dot" style={{ backgroundColor: '#10b981' }} />}
+                  {computedMandateStatus}
+                </span>
+              )}
             </div>
-            {demoActionStatus && (
-              <span className="badge badge-webhook" style={{ fontSize: '0.75rem' }}>
-                {demoActionStatus}
-              </span>
+
+            {activeMandate ? (
+              <div>
+                {/* Mandate ID */}
+                <div style={{ marginBottom: '14px', background: 'rgba(0,0,0,0.35)', padding: '10px 12px', borderRadius: '8px', border: '1px solid var(--border-subtle)' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' }}>
+                    <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                      Mandate ID
+                    </span>
+                    <button
+                      onClick={() => {
+                        navigator.clipboard.writeText(activeMandate.mandate_id);
+                        setCopiedMandateId(true);
+                        setTimeout(() => setCopiedMandateId(false), 2000);
+                      }}
+                      className="btn-secondary"
+                      style={{ fontSize: '0.7rem', padding: '2px 6px', gap: '4px' }}
+                      title="Copy full Mandate UUID"
+                    >
+                      {copiedMandateId ? <Check size={11} color="#34d399" /> : <Copy size={11} />}
+                      {copiedMandateId ? 'Copied' : 'Copy'}
+                    </button>
+                  </div>
+                  <div className="mono" style={{ fontSize: '0.8rem', color: '#38bdf8', wordBreak: 'break-all' }}>
+                    {activeMandate.mandate_id}
+                  </div>
+                </div>
+
+                {/* Amount & Category Grid */}
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginBottom: '14px' }}>
+                  <div style={{ background: 'rgba(255,255,255,0.03)', padding: '10px', borderRadius: '8px', border: '1px solid var(--border-subtle)' }}>
+                    <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginBottom: '2px' }}>Max Authorized</div>
+                    <div className="mono" style={{ fontSize: '1.1rem', fontWeight: 700, color: '#34d399' }}>
+                      ₹{Number(activeMandate.max_amount || 0).toLocaleString('en-IN')}
+                    </div>
+                  </div>
+
+                  <div style={{ background: 'rgba(255,255,255,0.03)', padding: '10px', borderRadius: '8px', border: '1px solid var(--border-subtle)' }}>
+                    <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginBottom: '2px' }}>Category Scope</div>
+                    <div className="mono" style={{ fontSize: '0.95rem', fontWeight: 700, color: '#a855f7', textTransform: 'uppercase' }}>
+                      {activeMandate.merchant_category || 'ALL'}
+                    </div>
+                  </div>
+                </div>
+
+                {/* Expiry with Live Countdown */}
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: '0.82rem', padding: '8px 10px', background: 'rgba(255,255,255,0.03)', borderRadius: '8px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: 'var(--text-muted)' }}>
+                    <Clock size={14} color={countdown?.isExpired ? '#f43f5e' : '#38bdf8'} />
+                    <span>Expires At:</span>
+                  </div>
+                  <div className="mono" style={{
+                    fontWeight: 600,
+                    color: countdown?.isExpired ? '#fb7185' : '#38bdf8',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '6px'
+                  }}>
+                    {countdown?.text}
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div style={{
+                textAlign: 'center',
+                padding: '24px 16px',
+                background: 'rgba(0,0,0,0.2)',
+                borderRadius: '10px',
+                border: '1px dashed var(--border-subtle)',
+                color: 'var(--text-muted)'
+              }}>
+                <Lock size={28} color="#64748b" style={{ margin: '0 auto 8px', opacity: 0.6 }} />
+                <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-primary)', marginBottom: '4px' }}>
+                  No Active Mandate Found
+                </div>
+                <div style={{ fontSize: '0.75rem', lineHeight: '1.4' }}>
+                  Autonomous payments require a hardware-signed WebAuthn mandate via the Trust Rail.
+                </div>
+              </div>
             )}
           </div>
 
-          {/* 3 Acts Trigger Buttons */}
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '10px', marginBottom: '18px' }}>
-            {/* Act 1 Button */}
-            <button
-              onClick={() => triggerDemoAct(1)}
-              disabled={isSubmitting}
-              className="btn-secondary"
-              style={{
-                display: 'flex',
-                flexDirection: 'column',
-                alignItems: 'flex-start',
-                padding: '12px',
-                textAlign: 'left',
-                borderLeft: '3px solid #10b981'
-              }}
-            >
-              <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontWeight: 700, fontSize: '0.82rem', color: '#34d399' }}>
-                <Play size={12} fill="#34d399" /> ACT 1: Happy Path
-              </div>
-              <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: '4px' }}>
-                Hotel Vendor A (₹12,000) → Allow + Payment
-              </div>
-            </button>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.78rem', color: 'var(--text-muted)', paddingTop: '10px', borderTop: '1px solid var(--border-subtle)', marginTop: '12px' }}>
+            <span>Cryptographic Nonce:</span>
+            <span className="mono" style={{ color: activeMandate?.nonce_used ? '#f43f5e' : '#10b981' }}>
+              {activeMandate ? (activeMandate.nonce_used ? 'CONSUMED (Locked)' : 'UNUSED (Valid)') : 'None'}
+            </span>
+          </div>
+        </div>
 
-            {/* Act 2 Button */}
-            <button
-              onClick={() => triggerDemoAct(2)}
-              disabled={isSubmitting}
-              className="btn-secondary"
-              style={{
-                display: 'flex',
-                flexDirection: 'column',
-                alignItems: 'flex-start',
-                padding: '12px',
-                textAlign: 'left',
-                borderLeft: '3px solid #f43f5e'
-              }}
-            >
-              <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontWeight: 700, fontSize: '0.82rem', color: '#fb7185' }}>
-                <ShieldAlert size={12} /> ACT 2: Blocked Path
+        {/* 3. Interactive 3-Act Demo Controller */}
+        <div className="glass-panel" style={{ padding: '22px', display: 'flex', flexDirection: 'column', justifyContent: 'space-between' }}>
+          <div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '14px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <Sparkles size={18} color="#38bdf8" />
+                <h3 style={{ fontSize: '1.05rem', fontWeight: 700 }}>Live Demo Sandbox</h3>
               </div>
-              <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: '4px' }}>
-                Presidential Suite (₹75,000) → Denied
-              </div>
-            </button>
+              {demoActionStatus && (
+                <span className="badge badge-webhook" style={{ fontSize: '0.75rem' }}>
+                  {demoActionStatus}
+                </span>
+              )}
+            </div>
 
-            {/* Act 3 Button */}
-            <button
-              onClick={() => triggerDemoAct(3)}
-              disabled={isSubmitting}
-              className="btn-secondary"
-              style={{
-                display: 'flex',
-                flexDirection: 'column',
-                alignItems: 'flex-start',
-                padding: '12px',
-                textAlign: 'left',
-                borderLeft: '3px solid #d946ef'
-              }}
-            >
-              <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontWeight: 700, fontSize: '0.82rem', color: '#e879f9' }}>
-                <Zap size={12} /> ACT 3: Duplicate/Race
-              </div>
-              <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: '4px' }}>
-                Simultaneous Replay → Blocked
-              </div>
-            </button>
+            {/* 3 Acts Trigger Buttons */}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '10px', marginBottom: '18px' }}>
+              {/* Act 1 Button */}
+              <button
+                onClick={() => triggerDemoAct(1)}
+                disabled={isSubmitting}
+                className="btn-secondary"
+                style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'flex-start',
+                  padding: '12px 10px',
+                  textAlign: 'left',
+                  borderLeft: '3px solid #10b981'
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontWeight: 700, fontSize: '0.8rem', color: '#34d399' }}>
+                  <Play size={11} fill="#34d399" /> ACT 1: Happy
+                </div>
+                <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '4px' }}>
+                  Hotel (₹12,000) → Allow
+                </div>
+              </button>
+
+              {/* Act 2 Button */}
+              <button
+                onClick={() => triggerDemoAct(2)}
+                disabled={isSubmitting}
+                className="btn-secondary"
+                style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'flex-start',
+                  padding: '12px 10px',
+                  textAlign: 'left',
+                  borderLeft: '3px solid #f43f5e'
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontWeight: 700, fontSize: '0.8rem', color: '#fb7185' }}>
+                  <ShieldAlert size={11} /> ACT 2: Exceed
+                </div>
+                <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '4px' }}>
+                  Suite (₹75,000) → Deny
+                </div>
+              </button>
+
+              {/* Act 3 Button */}
+              <button
+                onClick={() => triggerDemoAct(3)}
+                disabled={isSubmitting}
+                className="btn-secondary"
+                style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'flex-start',
+                  padding: '12px 10px',
+                  textAlign: 'left',
+                  borderLeft: '3px solid #d946ef'
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontWeight: 700, fontSize: '0.8rem', color: '#e879f9' }}>
+                  <Zap size={11} /> ACT 3: Race
+                </div>
+                <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '4px' }}>
+                  Replay → Blocked
+                </div>
+              </button>
+            </div>
           </div>
 
           {/* Custom Buyer Agent Natural Language Input */}
           <form onSubmit={handleCustomPromptSubmit} style={{ display: 'flex', gap: '10px' }}>
             <input
               type="text"
-              placeholder="Or type natural language buyer prompt (e.g. 'Book a cab with Cab Vendor B for ₹1,800')"
+              placeholder="Custom prompt (e.g. 'Book a cab with Cab Vendor B for ₹1,800')"
               value={customPrompt}
               onChange={(e) => setCustomPrompt(e.target.value)}
               style={{
@@ -539,45 +747,151 @@ export default function AgentPayDashboard() {
       </div>
 
       {/* -------------------------------------------------------------------- */}
-      {/* AUDIT TRAIL STREAM */}
+      {/* AUDIT TRAIL STREAM & TAMPER-EVIDENT LEDGER VERIFIER */}
       {/* -------------------------------------------------------------------- */}
       <div className="glass-panel" style={{ padding: '24px' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '18px', flexWrap: 'wrap', gap: '12px' }}>
           <div>
-            <h2 style={{ fontSize: '1.25rem', fontWeight: 700 }}>Live Firewall Audit Trail</h2>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+              <h2 style={{ fontSize: '1.25rem', fontWeight: 700 }}>Live Real-time Audit Trail</h2>
+              <span className="badge badge-agent" style={{ fontSize: '0.7rem' }}>
+                SHA-256 HASH CHAIN
+              </span>
+            </div>
             <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginTop: '2px' }}>
-              Real-time cryptographic audit log of all agent requests, deterministic policy checks, payment dispatches, and webhooks.
+              Cryptographically chained immutable ledger tracking mandate issuance, policy evaluations, and payment captures.
             </p>
           </div>
 
-          {/* Filter Tabs */}
-          <div style={{ display: 'flex', gap: '6px', background: 'rgba(0,0,0,0.3)', padding: '4px', borderRadius: '8px' }}>
-            {[
-              { id: 'all', label: 'All Events' },
-              { id: 'allowed', label: 'Allowed' },
-              { id: 'denied', label: 'Denied' },
-              { id: 'blocked', label: 'Duplicates Blocked' }
-            ].map((tab) => (
-              <button
-                key={tab.id}
-                onClick={() => setActiveTab(tab.id)}
-                style={{
-                  padding: '5px 12px',
-                  borderRadius: '6px',
-                  fontSize: '0.78rem',
-                  fontWeight: 600,
-                  border: 'none',
-                  cursor: 'pointer',
-                  background: activeTab === tab.id ? 'rgba(255,255,255,0.12)' : 'transparent',
-                  color: activeTab === tab.id ? '#ffffff' : 'var(--text-muted)',
-                  transition: 'all 0.2s ease'
-                }}
-              >
-                {tab.label}
-              </button>
-            ))}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+            {/* Verify Audit Chain Button */}
+            <button
+              onClick={handleVerifyAuditChain}
+              disabled={isVerifyingChain}
+              className="btn-secondary"
+              style={{
+                fontSize: '0.82rem',
+                padding: '6px 14px',
+                borderColor: 'rgba(99, 102, 241, 0.4)',
+                background: isVerifyingChain ? 'rgba(99, 102, 241, 0.2)' : 'rgba(99, 102, 241, 0.1)'
+              }}
+            >
+              <ShieldCheck size={15} color="#818cf8" />
+              {isVerifyingChain ? 'Verifying Hashes...' : 'Verify Audit Chain'}
+            </button>
+
+            {/* Filter Tabs */}
+            <div style={{ display: 'flex', gap: '6px', background: 'rgba(0,0,0,0.3)', padding: '4px', borderRadius: '8px' }}>
+              {[
+                { id: 'all', label: 'All Events' },
+                { id: 'allowed', label: 'Allowed' },
+                { id: 'denied', label: 'Denied' },
+                { id: 'blocked', label: 'Duplicates Blocked' }
+              ].map((tab) => (
+                <button
+                  key={tab.id}
+                  onClick={() => setActiveTab(tab.id)}
+                  style={{
+                    padding: '5px 12px',
+                    borderRadius: '6px',
+                    fontSize: '0.78rem',
+                    fontWeight: 600,
+                    border: 'none',
+                    cursor: 'pointer',
+                    background: activeTab === tab.id ? 'rgba(255,255,255,0.12)' : 'transparent',
+                    color: activeTab === tab.id ? '#ffffff' : 'var(--text-muted)',
+                    transition: 'all 0.2s ease'
+                  }}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </div>
           </div>
         </div>
+
+        {/* Inline Audit Chain Verification Result Display */}
+        {chainVerificationResult && (
+          <div style={{ marginBottom: '18px' }}>
+            {chainVerificationResult.valid ? (
+              <div
+                className="glass-panel glow-emerald"
+                style={{
+                  padding: '14px 18px',
+                  borderLeft: '4px solid #10b981',
+                  background: 'rgba(16, 185, 129, 0.08)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  flexWrap: 'wrap',
+                  gap: '12px'
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                  <div style={{ background: 'rgba(16, 185, 129, 0.2)', padding: '6px', borderRadius: '8px' }}>
+                    <CheckCircle2 size={20} color="#34d399" />
+                  </div>
+                  <div>
+                    <div style={{ fontWeight: 700, color: '#34d399', fontSize: '0.9rem' }}>
+                      Cryptographic Audit Chain Intact (0 Tampering Detected)
+                    </div>
+                    <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)', marginTop: '2px' }}>
+                      All {chainVerificationResult.count} sequential log entries verified from GENESIS anchor at{' '}
+                      {new Date(chainVerificationResult.verified_at || Date.now()).toLocaleTimeString()}.
+                    </div>
+                  </div>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <span className="badge badge-allow">VERIFIED SEALED</span>
+                  <button
+                    onClick={() => setChainVerificationResult(null)}
+                    style={{ background: 'transparent', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', fontSize: '0.8rem', padding: '4px 8px' }}
+                  >
+                    ✕
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div
+                className="glass-panel glow-rose"
+                style={{
+                  padding: '14px 18px',
+                  borderLeft: '4px solid #f43f5e',
+                  background: 'rgba(244, 63, 94, 0.08)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  flexWrap: 'wrap',
+                  gap: '12px'
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                  <div style={{ background: 'rgba(244, 63, 94, 0.2)', padding: '6px', borderRadius: '8px' }}>
+                    <XCircle size={20} color="#fb7185" />
+                  </div>
+                  <div>
+                    <div style={{ fontWeight: 700, color: '#fb7185', fontSize: '0.9rem' }}>
+                      Audit Chain Broken! Tampering Detected ({chainVerificationResult.reason || 'TAMPERED_ENTRY'})
+                    </div>
+                    <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)', marginTop: '2px' }}>
+                      Broken at Entry ID: <span className="mono" style={{ color: '#ffffff' }}>{chainVerificationResult.broken_at_entry_id || 'Unknown'}</span>{' '}
+                      (Index: {chainVerificationResult.entry_index ?? 'N/A'})
+                    </div>
+                  </div>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <span className="badge badge-deny">CHAIN INVALID</span>
+                  <button
+                    onClick={() => setChainVerificationResult(null)}
+                    style={{ background: 'transparent', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', fontSize: '0.8rem', padding: '4px 8px' }}
+                  >
+                    ✕
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Audit Log Table */}
         <div style={{ overflowX: 'auto' }}>
@@ -585,11 +899,11 @@ export default function AgentPayDashboard() {
             <thead>
               <tr style={{ borderBottom: '1px solid var(--border-subtle)', color: 'var(--text-muted)', fontSize: '0.75rem', textTransform: 'uppercase' }}>
                 <th style={{ padding: '10px 14px' }}>Timestamp</th>
-                <th style={{ padding: '10px 14px' }}>Event</th>
+                <th style={{ padding: '10px 14px' }}>Event Type</th>
                 <th style={{ padding: '10px 14px' }}>Agent / Merchant</th>
                 <th style={{ padding: '10px 14px' }}>Amount</th>
-                <th style={{ padding: '10px 14px' }}>Firewall Decision / Reason</th>
-                <th style={{ padding: '10px 14px' }}>Razorpay Order</th>
+                <th style={{ padding: '10px 14px' }}>Decision / Detail</th>
+                <th style={{ padding: '10px 14px' }}>SHA-256 Hash Link</th>
                 <th style={{ padding: '10px 14px' }}>Inspect</th>
               </tr>
             </thead>
@@ -608,22 +922,25 @@ export default function AgentPayDashboard() {
                   const time = new Date(log.created_at).toLocaleTimeString();
                   
                   const isAllow = eventType === 'POLICY_EVALUATED' && detail.decision === 'ALLOW';
-                  const isDeny = eventType === 'DENIED';
+                  const isDeny = eventType === 'DENIED' || eventType === 'MANDATE_DENIED' || eventType === 'VOIDED';
                   const isBlocked = eventType === 'DUPLICATE_BLOCKED';
                   const isWebhook = eventType === 'WEBHOOK_RECEIVED';
-                  const isPayment = eventType === 'PAYMENT_CREATED';
+                  const isCaptured = eventType === 'CAPTURED';
+                  const isAuthorized = eventType === 'AUTHORIZED';
+                  const isMandateIssued = eventType === 'MANDATE_ISSUED';
+                  const isMandateVerified = eventType === 'MANDATE_VERIFIED';
                   const isAgentReq = eventType === 'AGENT_REQUESTED';
 
                   let badgeClass = 'badge-agent';
-                  if (isAllow) badgeClass = 'badge-allow';
+                  if (isAllow || isCaptured || isMandateIssued) badgeClass = 'badge-allow';
                   if (isDeny) badgeClass = 'badge-deny';
                   if (isBlocked) badgeClass = 'badge-blocked';
                   if (isWebhook) badgeClass = 'badge-webhook';
-                  if (isPayment) badgeClass = 'badge-allow';
+                  if (isAuthorized || isMandateVerified) badgeClass = 'badge-agent';
 
-                  const amount = detail.amount || tx.amount || detail.extracted_intent?.amount || '-';
-                  const merchant = detail.merchant || tx.merchant || detail.extracted_intent?.merchant || '-';
-                  const razorpayId = detail.razorpay_id || tx.razorpay_order_id || '-';
+                  const amount = detail.amount || tx.amount || detail.max_amount || detail.extracted_intent?.amount || '-';
+                  const merchant = detail.merchant || tx.merchant || detail.merchant_category || detail.extracted_intent?.merchant || '-';
+                  const entryHashTruncated = log.entry_hash ? `${log.entry_hash.substring(0, 10)}...` : 'Unchained';
 
                   return (
                     <tr
@@ -662,21 +979,20 @@ export default function AgentPayDashboard() {
 
                       <td style={{ padding: '12px 14px' }}>
                         {isAllow && <span style={{ color: '#34d399', fontWeight: 600 }}>✅ ALLOWED (Policy Passed)</span>}
-                        {isDeny && <span style={{ color: '#fb7185', fontWeight: 600 }}>❌ {detail.reason || tx.reason || 'DENIED'}</span>}
+                        {isDeny && <span style={{ color: '#fb7185', fontWeight: 600 }}>❌ {detail.reason_code || detail.reason || tx.reason || 'DENIED'}</span>}
                         {isBlocked && <span style={{ color: '#e879f9', fontWeight: 600 }}>🛡️ DUPLICATE REPLAY BLOCKED</span>}
-                        {isPayment && <span style={{ color: '#38bdf8' }}>💳 Order Created on Razorpay</span>}
-                        {isWebhook && <span style={{ color: '#38bdf8' }}>⚡ Webhook Captured ({detail.target_status || 'SUCCESS'})</span>}
-                        {isAgentReq && <span style={{ color: 'var(--text-muted)' }}>🤖 Extracted Intent from prompt</span>}
+                        {isAuthorized && <span style={{ color: '#818cf8', fontWeight: 600 }}>🔒 AUTHORIZED (Hold Created)</span>}
+                        {isCaptured && <span style={{ color: '#34d399', fontWeight: 600 }}>💳 CAPTURED (Settled)</span>}
+                        {isMandateIssued && <span style={{ color: '#38bdf8' }}>📜 Mandate Issued (WebAuthn Signed)</span>}
+                        {isMandateVerified && <span style={{ color: '#34d399' }}>🛡️ Mandate Verified (Token Issued)</span>}
+                        {isWebhook && <span style={{ color: '#38bdf8' }}>⚡ Webhook Captured ({detail.event || 'payment.captured'})</span>}
+                        {isAgentReq && <span style={{ color: 'var(--text-muted)' }}>🤖 Extracted Buyer Intent</span>}
                       </td>
 
                       <td style={{ padding: '12px 14px' }} className="mono">
-                        {razorpayId !== '-' ? (
-                          <span style={{ color: '#a855f7', fontSize: '0.8rem' }}>
-                            {razorpayId}
-                          </span>
-                        ) : (
-                          <span style={{ color: 'var(--text-muted)', fontSize: '0.75rem' }}>N/A (Blocked)</span>
-                        )}
+                        <span style={{ color: log.entry_hash ? '#38bdf8' : 'var(--text-muted)', fontSize: '0.78rem' }}>
+                          {entryHashTruncated}
+                        </span>
                       </td>
 
                       <td style={{ padding: '12px 14px' }}>
@@ -743,6 +1059,16 @@ export default function AgentPayDashboard() {
             <div style={{ marginBottom: '14px', fontSize: '0.85rem' }}>
               <div style={{ color: 'var(--text-muted)' }}>Event ID: <span className="mono" style={{ color: '#fff' }}>{selectedLog.id}</span></div>
               <div style={{ color: 'var(--text-muted)', marginTop: '4px' }}>Recorded At: <span className="mono" style={{ color: '#fff' }}>{new Date(selectedLog.created_at).toISOString()}</span></div>
+              {selectedLog.prev_hash && (
+                <div style={{ color: 'var(--text-muted)', marginTop: '4px' }}>
+                  Previous Hash: <span className="mono" style={{ color: '#38bdf8' }}>{selectedLog.prev_hash}</span>
+                </div>
+              )}
+              {selectedLog.entry_hash && (
+                <div style={{ color: 'var(--text-muted)', marginTop: '4px' }}>
+                  Entry Hash: <span className="mono" style={{ color: '#10b981' }}>{selectedLog.entry_hash}</span>
+                </div>
+              )}
             </div>
 
             <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: '6px' }}>

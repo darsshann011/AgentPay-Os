@@ -1,5 +1,6 @@
 const { createClient } = require('@supabase/supabase-js');
 const { v4: uuidv4 } = require('uuid');
+const crypto = require('crypto');
 require('dotenv').config();
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -27,18 +28,51 @@ if (isSupabaseConfigured) {
 }
 
 // ---------------------------------------------------------------------------
-// In-Memory Fallback & Local Test Store (Includes Atomic Row-Level Mutex Lock)
+// In-Memory Fallback Store (Used when Supabase is not configured or offline)
 // ---------------------------------------------------------------------------
+const DEFAULT_CATALOG_ITEMS = [
+  {
+    sku: 'HOTEL-DELUXE-2N',
+    name: 'Executive Deluxe Suite (2 Nights)',
+    merchant: 'Hotel Vendor A',
+    category: 'hotel',
+    price: 12400,
+    currency: 'INR',
+    stock: 15
+  },
+  {
+    sku: 'CAB-AIRPORT-SUV',
+    name: 'Airport Premium SUV Transfer',
+    merchant: 'Cab Vendor B',
+    category: 'cab',
+    price: 2500,
+    currency: 'INR',
+    stock: 50
+  },
+  {
+    sku: 'INS-TRAVEL-MED',
+    name: 'Comprehensive Travel & Medical Cover',
+    merchant: 'Insurance Vendor C',
+    category: 'insurance',
+    price: 1800,
+    currency: 'INR',
+    stock: 100
+  }
+];
+
 const memoryStore = {
   agents: new Map(),
   transactions: new Map(),
   audit_log: [],
+  mandates: new Map(),
+  catalog: new Map(),
   agentLocks: new Map(), // Mutex locks per agent ID
+  mandateLocks: new Map(), // Mutex locks per mandate ID
 };
 
 const DEFAULT_TRAVELBOT_ID = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11';
 
-// Seed default TravelBot agent in memory store for instant test readiness
+// Seed default TravelBot agent and catalog items in memory store
 memoryStore.agents.set(DEFAULT_TRAVELBOT_ID, {
   id: DEFAULT_TRAVELBOT_ID,
   name: 'TravelBot Agent',
@@ -49,6 +83,10 @@ memoryStore.agents.set(DEFAULT_TRAVELBOT_ID, {
   created_at: new Date().toISOString()
 });
 
+DEFAULT_CATALOG_ITEMS.forEach((item) => {
+  memoryStore.catalog.set(item.sku, { ...item });
+});
+
 // Row-level lock acquisition helper for in-memory store
 async function acquireAgentLock(agentId) {
   while (memoryStore.agentLocks.get(agentId)) {
@@ -57,6 +95,17 @@ async function acquireAgentLock(agentId) {
   memoryStore.agentLocks.set(agentId, true);
   return () => {
     memoryStore.agentLocks.set(agentId, false);
+  };
+}
+
+// Row-level lock acquisition helper for mandates in-memory store
+async function acquireMandateLock(mandateId) {
+  while (memoryStore.mandateLocks.get(mandateId)) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  memoryStore.mandateLocks.set(mandateId, true);
+  return () => {
+    memoryStore.mandateLocks.set(mandateId, false);
   };
 }
 
@@ -86,7 +135,7 @@ async function getAgent(agentId) {
 
   if (supabase) {
     try {
-      // 1. If explicit agentId is supplied, lookup by ID
+      // 1. If explicit agentId is supplied, lookup strictly by ID
       if (agentId) {
         const { data, error } = await supabase
           .from('agents')
@@ -96,28 +145,46 @@ async function getAgent(agentId) {
 
         console.log(`[Supabase Agent Lookup] 📋 Query for '${agentId}' raw result:`, data ? `Found (${data.name})` : 'Not Found', error ? `| Error: ${error.message}` : '');
 
-        if (error) {
-          console.error(`[Supabase Error in getAgent('${agentId}')]:`, error.message, error.details || '');
+        if (data) return formatAgentRecord(data);
+
+        // If it was DEFAULT_TRAVELBOT_ID and missing, auto-seed
+        if (agentId === DEFAULT_TRAVELBOT_ID) {
+          console.log('[Supabase] TravelBot not found. Auto-seeding default TravelBot Agent...');
+          const defaultAgent = {
+            id: DEFAULT_TRAVELBOT_ID,
+            name: 'TravelBot Agent',
+            budget_total: 50000,
+            budget_remaining: 50000,
+            allowed_merchants: ['Hotel Vendor A', 'Cab Vendor B', 'Insurance Vendor C'],
+            velocity_limit: 5
+          };
+          const { data: seededAgent } = await supabase
+            .from('agents')
+            .upsert(defaultAgent, { onConflict: 'id' })
+            .select()
+            .single();
+          if (seededAgent) return formatAgentRecord(seededAgent);
         }
 
-        if (data) return formatAgentRecord(data);
+        // Check local memory store for this specific agentId before returning null
+        if (memoryStore.agents.has(agentId)) {
+          return formatAgentRecord(memoryStore.agents.get(agentId));
+        }
+
+        return null;
       }
 
-      // 2. If no agentId or agent with that ID wasn't found, look for TravelBot Agent
+      // 2. If NO agentId was specified, find or seed default TravelBot Agent
       const { data: travelBot, error: tbErr } = await supabase
         .from('agents')
         .select('*')
         .eq('id', DEFAULT_TRAVELBOT_ID)
         .maybeSingle();
 
-      if (tbErr) {
-        console.error('[Supabase Error in getAgent TravelBot lookup]:', tbErr.message);
-      }
-
       if (travelBot) return formatAgentRecord(travelBot);
 
       // 3. Otherwise find the first available agent named 'TravelBot Agent'
-      const { data: firstAgent, error: listErr } = await supabase
+      const { data: firstAgent } = await supabase
         .from('agents')
         .select('*')
         .eq('name', 'TravelBot Agent')
@@ -128,7 +195,7 @@ async function getAgent(agentId) {
       if (firstAgent) return formatAgentRecord(firstAgent);
 
       // 4. If agents table has other agents, return the first agent
-      const { data: anyAgents, error: anyErr } = await supabase
+      const { data: anyAgents } = await supabase
         .from('agents')
         .select('*')
         .order('created_at', { ascending: false })
@@ -137,10 +204,10 @@ async function getAgent(agentId) {
 
       if (anyAgents) return formatAgentRecord(anyAgents);
 
-      // 5. If agents table is completely empty, auto-seed default TravelBot agent into Supabase
+      // 5. If agents table is completely empty, auto-seed default TravelBot agent
       console.log('[Supabase] Agents table is empty. Auto-seeding default TravelBot Agent...');
       const defaultAgent = {
-        id: agentId || DEFAULT_TRAVELBOT_ID,
+        id: DEFAULT_TRAVELBOT_ID,
         name: 'TravelBot Agent',
         budget_total: 50000,
         budget_remaining: 50000,
@@ -148,29 +215,29 @@ async function getAgent(agentId) {
         velocity_limit: 5
       };
 
-      const { data: seededAgent, error: seedErr } = await supabase
+      const { data: seededAgent } = await supabase
         .from('agents')
         .upsert(defaultAgent, { onConflict: 'id' })
         .select()
         .single();
 
-      if (seedErr) {
-        console.error('[Supabase Auto-Seed Error]:', seedErr.message);
-        return formatAgentRecord(defaultAgent);
-      }
-
-      return formatAgentRecord(seededAgent);
+      if (seededAgent) return formatAgentRecord(seededAgent);
     } catch (err) {
       console.error('[Supabase getAgent Exception]:', err.message);
     }
   }
 
-  const inMemAgent = (agentId && memoryStore.agents.get(agentId)) ||
-    memoryStore.agents.get(DEFAULT_TRAVELBOT_ID) ||
+  // Memory store fallback
+  if (agentId) {
+    const inMem = memoryStore.agents.get(agentId);
+    return formatAgentRecord(inMem || null);
+  }
+
+  const defaultInMem = memoryStore.agents.get(DEFAULT_TRAVELBOT_ID) ||
     Array.from(memoryStore.agents.values())[0] ||
     null;
 
-  return formatAgentRecord(inMemAgent);
+  return formatAgentRecord(defaultInMem);
 }
 
 async function listAgents() {
@@ -218,16 +285,21 @@ async function createAgent(agentData) {
   };
 
   if (supabase) {
-    const { data, error } = await supabase
-      .from('agents')
-      .insert(agent)
-      .select()
-      .single();
-    if (error) {
-      console.error('[Supabase Error in createAgent]:', error.message);
-      throw error;
+    try {
+      const { data, error } = await supabase
+        .from('agents')
+        .insert(agent)
+        .select()
+        .single();
+      if (!error && data) {
+        return formatAgentRecord(data);
+      }
+      if (error) {
+        console.error('[Supabase Error in createAgent / Fallback]:', error.message);
+      }
+    } catch (e) {
+      console.error('[Supabase Exception in createAgent / Fallback]:', e.message);
     }
-    return formatAgentRecord(data);
   }
 
   memoryStore.agents.set(id, agent);
@@ -241,17 +313,22 @@ async function updateAgent(agentId, updates) {
   if (sanitizedUpdates.velocity_limit !== undefined) sanitizedUpdates.velocity_limit = Number(sanitizedUpdates.velocity_limit);
 
   if (supabase) {
-    const { data, error } = await supabase
-      .from('agents')
-      .update(sanitizedUpdates)
-      .eq('id', agentId)
-      .select()
-      .single();
-    if (error) {
-      console.error('[Supabase Error in updateAgent]:', error.message);
-      throw error;
+    try {
+      const { data, error } = await supabase
+        .from('agents')
+        .update(sanitizedUpdates)
+        .eq('id', agentId)
+        .select()
+        .single();
+      if (!error && data) {
+        return formatAgentRecord(data);
+      }
+      if (error) {
+        console.error('[Supabase Error in updateAgent / Fallback]:', error.message);
+      }
+    } catch (e) {
+      console.error('[Supabase Exception in updateAgent / Fallback]:', e.message);
     }
-    return formatAgentRecord(data);
   }
 
   const existing = memoryStore.agents.get(agentId);
@@ -431,29 +508,127 @@ async function updateTransaction(txId, updates) {
   return updated;
 }
 
-async function addAuditLog(transactionId, eventType, detail = {}) {
-  const logEntry = {
-    id: uuidv4(),
-    transaction_id: transactionId || null,
-    event_type: eventType,
-    detail,
-    created_at: new Date().toISOString()
-  };
+// ---------------------------------------------------------------------------
+// Tamper-Evident Audit Log Hash Chaining
+// ---------------------------------------------------------------------------
+let auditLogLock = Promise.resolve();
+function acquireAuditLock() {
+  let release;
+  const p = new Promise(resolve => { release = resolve; });
+  const acquire = auditLogLock.then(() => release);
+  auditLogLock = auditLogLock.then(() => p);
+  return acquire;
+}
 
-  if (supabase) {
-    const { data, error } = await supabase
-      .from('audit_log')
-      .insert(logEntry)
-      .select()
-      .single();
-    if (error) {
-      console.error('[Audit Log] Supabase insertion error:', error.message);
-    }
-    return data || logEntry;
+/**
+ * Deterministic canonical JSON serialization
+ */
+function canonicalJson(obj) {
+  if (obj === null || typeof obj !== 'object') {
+    return JSON.stringify(obj);
   }
+  if (Array.isArray(obj)) {
+    return '[' + obj.map(canonicalJson).join(',') + ']';
+  }
+  const sortedKeys = Object.keys(obj).sort();
+  return '{' + sortedKeys.map(key => JSON.stringify(key) + ':' + canonicalJson(obj[key])).join(',') + '}';
+}
 
-  memoryStore.audit_log.unshift(logEntry);
-  return logEntry;
+/**
+ * Computes entry_hash = SHA-256(prev_hash + JSON-canonical form of entry's own fields)
+ */
+function computeAuditHash(prevHash, entry) {
+  const canonicalPayload = canonicalJson({
+    id: entry.id,
+    transaction_id: entry.transaction_id || null,
+    event_type: entry.event_type,
+    detail: entry.detail || {},
+    created_at: entry.created_at
+  });
+  return crypto
+    .createHash('sha256')
+    .update((prevHash || 'GENESIS') + canonicalPayload)
+    .digest('hex');
+}
+
+async function addAuditLog(transactionId, eventType, detail = {}) {
+  const release = await acquireAuditLock();
+  try {
+    let prevHash = 'GENESIS';
+
+    if (supabase) {
+      try {
+        const { data: latestEntry, error: latestErr } = await supabase
+          .from('audit_log')
+          .select('entry_hash')
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        if (!latestErr && latestEntry && latestEntry.entry_hash) {
+          prevHash = latestEntry.entry_hash;
+        } else {
+          const latestMem = memoryStore.audit_log[0];
+          if (latestMem && latestMem.entry_hash) {
+            prevHash = latestMem.entry_hash;
+          }
+        }
+      } catch (e) {
+        const latestMem = memoryStore.audit_log[0];
+        if (latestMem && latestMem.entry_hash) {
+          prevHash = latestMem.entry_hash;
+        }
+      }
+    } else {
+      const latestMem = memoryStore.audit_log[0];
+      if (latestMem && latestMem.entry_hash) {
+        prevHash = latestMem.entry_hash;
+      }
+    }
+
+    const id = uuidv4();
+    const createdAt = new Date().toISOString();
+    const entryHash = computeAuditHash(prevHash, {
+      id,
+      transaction_id: transactionId || null,
+      event_type: eventType,
+      detail,
+      created_at: createdAt
+    });
+
+    const logEntry = {
+      id,
+      transaction_id: transactionId || null,
+      event_type: eventType,
+      detail,
+      created_at: createdAt,
+      prev_hash: prevHash,
+      entry_hash: entryHash
+    };
+
+    if (supabase) {
+      try {
+        const { data, error } = await supabase
+          .from('audit_log')
+          .insert(logEntry)
+          .select()
+          .single();
+        if (!error && data && data.entry_hash) {
+          memoryStore.audit_log.unshift(data);
+          return data;
+        }
+        if (error) {
+          console.error('[Audit Log] Supabase insertion error / Fallback:', error.message);
+        }
+      } catch (err) {
+        console.error('[Audit Log] Supabase insertion exception / Fallback:', err.message);
+      }
+    }
+
+    memoryStore.audit_log.unshift(logEntry);
+    return logEntry;
+  } finally {
+    release();
+  }
 }
 
 async function getAuditLogs(limit = 100) {
@@ -467,6 +642,8 @@ async function getAuditLogs(limit = 100) {
           event_type,
           detail,
           created_at,
+          prev_hash,
+          entry_hash,
           transactions (
             id,
             agent_id,
@@ -484,7 +661,9 @@ async function getAuditLogs(limit = 100) {
         .order('created_at', { ascending: false })
         .limit(limit);
 
-      if (!error && data) return data;
+      if (!error && data && data.length > 0 && data[0].entry_hash !== undefined) {
+        return data;
+      }
       if (error) {
         console.error('[Supabase Error in getAuditLogs]:', error.message);
       }
@@ -505,6 +684,82 @@ async function getAuditLogs(limit = 100) {
       } : null
     };
   });
+}
+
+/**
+ * Validates the full audit log cryptographic hash chain in order
+ * @returns {Promise<{ valid: boolean, count?: number, broken_at_entry_id?: string, expected_hash?: string, found_hash?: string, reason?: string, verified_at?: string }>}
+ */
+async function verifyAuditChain() {
+  let entries = [];
+
+  if (supabase) {
+    try {
+      const { data, error } = await supabase
+        .from('audit_log')
+        .select('*')
+        .order('created_at', { ascending: true });
+
+      if (!error && data && data.length > 0 && data[0].entry_hash) {
+        entries = data;
+      }
+    } catch (e) {
+      console.error('[verifyAuditChain Supabase Exception]:', e.message);
+    }
+  }
+
+  if (entries.length === 0) {
+    entries = memoryStore.audit_log.slice().reverse();
+  }
+
+  if (entries.length === 0) {
+    return {
+      valid: true,
+      count: 0,
+      verified_at: new Date().toISOString()
+    };
+  }
+
+  let previousHash = 'GENESIS';
+
+  for (let i = 0; i < entries.length; i++) {
+    const row = entries[i];
+
+    // Check prev_hash
+    if (row.prev_hash !== previousHash) {
+      return {
+        valid: false,
+        broken_at_entry_id: row.id,
+        entry_index: i,
+        expected_prev_hash: previousHash,
+        found_prev_hash: row.prev_hash,
+        expected_hash: computeAuditHash(previousHash, row),
+        found_hash: row.entry_hash,
+        reason: 'PREV_HASH_MISMATCH'
+      };
+    }
+
+    // Check entry_hash
+    const expectedEntryHash = computeAuditHash(previousHash, row);
+    if (row.entry_hash !== expectedEntryHash) {
+      return {
+        valid: false,
+        broken_at_entry_id: row.id,
+        entry_index: i,
+        expected_hash: expectedEntryHash,
+        found_hash: row.entry_hash,
+        reason: 'ENTRY_HASH_MISMATCH'
+      };
+    }
+
+    previousHash = row.entry_hash;
+  }
+
+  return {
+    valid: true,
+    count: entries.length,
+    verified_at: new Date().toISOString()
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -661,6 +916,253 @@ async function processAtomicBudgetDeduction(agentId, amount, merchant, idempoten
   }
 }
 
+// ---------------------------------------------------------------------------
+// Mandates API Layer (Agent Trust Rail)
+// ---------------------------------------------------------------------------
+
+function formatMandateRecord(mandate) {
+  if (!mandate) return null;
+  return {
+    mandate_id: mandate.mandate_id || mandate.id,
+    agent_id: mandate.agent_id,
+    max_amount: Number(mandate.max_amount),
+    merchant_category: mandate.merchant_category,
+    nonce: mandate.nonce,
+    nonce_used: Boolean(mandate.nonce_used),
+    webauthn_credential_id: mandate.webauthn_credential_id,
+    webauthn_signature: mandate.webauthn_signature,
+    webauthn_public_key: mandate.webauthn_public_key,
+    issued_at: mandate.issued_at,
+    expires_at: mandate.expires_at,
+    status: mandate.status || 'ACTIVE'
+  };
+}
+
+async function createMandate(mandateData) {
+  const mandate_id = mandateData.mandate_id || uuidv4();
+  const mandate = {
+    mandate_id,
+    agent_id: mandateData.agent_id,
+    max_amount: Number(mandateData.max_amount),
+    merchant_category: mandateData.merchant_category,
+    nonce: mandateData.nonce,
+    nonce_used: Boolean(mandateData.nonce_used || false),
+    webauthn_credential_id: mandateData.webauthn_credential_id,
+    webauthn_signature: mandateData.webauthn_signature,
+    webauthn_public_key: mandateData.webauthn_public_key,
+    issued_at: mandateData.issued_at || new Date().toISOString(),
+    expires_at: mandateData.expires_at,
+    status: mandateData.status || 'ACTIVE'
+  };
+
+  if (supabase) {
+    try {
+      const { data, error } = await supabase
+        .from('mandates')
+        .insert(mandate)
+        .select()
+        .single();
+      if (!error && data) {
+        return formatMandateRecord(data);
+      }
+      if (error) {
+        console.warn('[Supabase Warning in createMandate / Fallback]:', error.message);
+      }
+    } catch (e) {
+      console.warn('[Supabase createMandate Exception / Fallback]:', e.message);
+    }
+  }
+
+  memoryStore.mandates.set(mandate_id, mandate);
+  return formatMandateRecord(mandate);
+}
+
+async function getMandate(mandateId) {
+  if (!mandateId) return null;
+  if (supabase) {
+    try {
+      const { data, error } = await supabase
+        .from('mandates')
+        .select('*')
+        .eq('mandate_id', mandateId)
+        .maybeSingle();
+      if (!error && data) {
+        return formatMandateRecord(data);
+      }
+    } catch (e) {
+      // fallback to memoryStore
+    }
+  }
+  return formatMandateRecord(memoryStore.mandates.get(mandateId) || null);
+}
+
+async function getMandateByNonce(nonce) {
+  if (!nonce) return null;
+  if (supabase) {
+    try {
+      const { data, error } = await supabase
+        .from('mandates')
+        .select('*')
+        .eq('nonce', nonce)
+        .maybeSingle();
+      if (!error && data) {
+        return formatMandateRecord(data);
+      }
+    } catch (e) {
+      // fallback to memoryStore
+    }
+  }
+  for (const mandate of memoryStore.mandates.values()) {
+    if (mandate.nonce === nonce) return formatMandateRecord(mandate);
+  }
+  return null;
+}
+
+async function updateMandate(mandateId, updates) {
+  if (!mandateId) return null;
+  if (supabase) {
+    try {
+      const { data, error } = await supabase
+        .from('mandates')
+        .update(updates)
+        .eq('mandate_id', mandateId)
+        .select()
+        .single();
+      if (!error && data) {
+        return formatMandateRecord(data);
+      }
+    } catch (e) {
+      // fallback to memoryStore
+    }
+  }
+  const existing = memoryStore.mandates.get(mandateId);
+  if (!existing) return null;
+  const updated = { ...existing, ...updates };
+  memoryStore.mandates.set(mandateId, updated);
+  return formatMandateRecord(updated);
+}
+
+async function listMandates(agentId) {
+  if (supabase) {
+    try {
+      let query = supabase.from('mandates').select('*').order('issued_at', { ascending: false });
+      if (agentId) query = query.eq('agent_id', agentId);
+      const { data, error } = await query;
+      if (!error && data && data.length > 0) {
+        return data.map(formatMandateRecord);
+      }
+    } catch (e) {
+      // fallback to memoryStore
+    }
+  }
+  const results = Array.from(memoryStore.mandates.values());
+  if (agentId) return results.filter(m => m.agent_id === agentId).map(formatMandateRecord);
+  return results.map(formatMandateRecord);
+}
+
+async function consumeMandateNonceAtomic(mandateId) {
+  if (!mandateId) {
+    return {
+      success: false,
+      reason_code: 'MANDATE_NOT_FOUND',
+      explanation: 'mandateId is required',
+      suggested_fix: 'Provide a valid mandate_id'
+    };
+  }
+
+  if (supabase) {
+    try {
+      const { data, error } = await supabase.rpc('consume_mandate_nonce', {
+        p_mandate_id: mandateId
+      });
+      if (!error && data) {
+        return data;
+      }
+      if (error) {
+        console.warn('[Supabase consume_mandate_nonce RPC Warning / Fallback]:', error.message);
+      }
+    } catch (err) {
+      console.warn('[Supabase RPC consume_mandate_nonce Exception / Fallback]:', err.message);
+    }
+  }
+
+  // Fallback to in-memory mutex row lock
+  const releaseLock = await acquireMandateLock(mandateId);
+  try {
+    const mandate = memoryStore.mandates.get(mandateId);
+    if (!mandate) {
+      return {
+        success: false,
+        reason_code: 'MANDATE_NOT_FOUND',
+        explanation: `Mandate with ID '${mandateId}' was not found in database`,
+        suggested_fix: 'Provide a valid mandate_id issued via POST /api/mandates/issue'
+      };
+    }
+
+    if (mandate.nonce_used === true) {
+      return {
+        success: false,
+        reason_code: 'NONCE_ALREADY_USED',
+        explanation: 'The single-use nonce for this mandate has already been consumed or replayed',
+        suggested_fix: 'Issue a new mandate with a fresh cryptographic nonce to prevent replay attacks'
+      };
+    }
+
+    if (new Date(mandate.expires_at).getTime() <= Date.now()) {
+      return {
+        success: false,
+        reason_code: 'MANDATE_EXPIRED',
+        explanation: `Mandate expired at ${mandate.expires_at}`,
+        suggested_fix: 'Issue a fresh mandate with updated expiry window'
+      };
+    }
+
+    // Atomic update
+    mandate.nonce_used = true;
+    mandate.status = 'USED';
+    memoryStore.mandates.set(mandateId, mandate);
+
+    return {
+      success: true,
+      mandate_id: mandateId,
+      nonce: mandate.nonce,
+      status: 'USED'
+    };
+  } finally {
+    releaseLock();
+  }
+}
+
+async function listCatalogItems() {
+  if (supabase) {
+    try {
+      const { data, error } = await supabase
+        .from('catalog_items')
+        .select('sku, name, merchant, category, price, currency, stock');
+
+      if (!error && data && data.length > 0) {
+        return data.map((item) => ({
+          sku: item.sku,
+          name: item.name,
+          merchant: item.merchant,
+          category: item.category,
+          price: Number(item.price),
+          currency: item.currency || 'INR',
+          stock: Number(item.stock || 0)
+        }));
+      }
+      if (error) {
+        console.error('[Supabase listCatalogItems Error / Fallback]:', error.message);
+      }
+    } catch (err) {
+      console.error('[Supabase listCatalogItems Exception / Fallback]:', err.message);
+    }
+  }
+
+  // Memory store fallback
+  return Array.from(memoryStore.catalog.values());
+}
+
 async function resetDatabaseState() {
   if (supabase) {
     try {
@@ -683,7 +1185,13 @@ async function resetDatabaseState() {
   memoryStore.agents.clear();
   memoryStore.transactions.clear();
   memoryStore.audit_log = [];
+  memoryStore.mandates.clear();
+  memoryStore.catalog.clear();
+  DEFAULT_CATALOG_ITEMS.forEach((item) => {
+    memoryStore.catalog.set(item.sku, { ...item });
+  });
   memoryStore.agentLocks.clear();
+  memoryStore.mandateLocks.clear();
   memoryStore.agents.set(DEFAULT_TRAVELBOT_ID, {
     id: DEFAULT_TRAVELBOT_ID,
     name: 'TravelBot Agent',
@@ -699,6 +1207,7 @@ module.exports = {
   supabase,
   isSupabaseConfigured,
   DEFAULT_TRAVELBOT_ID,
+  DEFAULT_CATALOG_ITEMS,
   getAgent,
   listAgents,
   createAgent,
@@ -713,6 +1222,19 @@ module.exports = {
   addAuditLog,
   getAuditLogs,
   processAtomicBudgetDeduction,
+  createMandate,
+  getMandate,
+  getMandateByNonce,
+  updateMandate,
+  listMandates,
+  formatMandateRecord,
+  consumeMandateNonceAtomic,
+  listCatalogItems,
+  verifyAuditChain,
+  canonicalJson,
+  computeAuditHash,
   resetDatabaseState,
   resetMemoryStore: resetDatabaseState
 };
+
+

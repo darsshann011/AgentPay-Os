@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
-    "test": "node --test test/**/*.test.js",
+    "test": "node --test --test-force-exit test/**/*.test.js",
     "cleanup:test-data": "node scripts/cleanupTestData.js",
     "seed": "node scripts/seed.js",
     "simulate": "node scripts/simulateBuyer.js"
@@ -23,6 +23,7 @@
   "license": "MIT",
   "dependencies": {
     "@google/generative-ai": "^0.24.0",
+    "@simplewebauthn/server": "^13.3.3",
     "@supabase/supabase-js": "^2.49.1",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",

@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { evaluate } = require('../src/services/policyEngine');
 
-test('Policy Engine - Step 2 Pure Rule Evaluation', async (t) => {
+test('Policy Engine - Step 2 Pure Rule Evaluation & Structured Denials', async (t) => {
   const fakeAgentState = {
     id: 'test-agent-001',
     name: 'TravelBot Agent',
@@ -28,7 +28,7 @@ test('Policy Engine - Step 2 Pure Rule Evaluation', async (t) => {
     assert.equal(result.ruleEvaluations.every(r => r.passed), true);
   });
 
-  await t.test('2. Should DENY request exceeding budget_remaining', () => {
+  await t.test('2. Should DENY request exceeding budget_remaining with structured denial shape', () => {
     const request = {
       amount: 40000, // exceeds budget_remaining (35000)
       merchant: 'Hotel Vendor A',
@@ -37,8 +37,14 @@ test('Policy Engine - Step 2 Pure Rule Evaluation', async (t) => {
 
     const result = evaluate(request, fakeAgentState);
     assert.equal(result.decision, 'DENY');
+    assert.equal(result.stage, 'POLICY_ENGINE');
+    assert.equal(result.reason_code, 'BUDGET_EXCEEDED');
     assert.equal(result.ruleViolated, 'BUDGET_CHECK');
-    assert.match(result.reason, /BUDGET_EXCEEDED/);
+    assert.ok(result.explanation.includes('40000'));
+    assert.ok(result.explanation.includes('35000'));
+    assert.ok(result.suggested_fix.includes('35000'));
+    assert.ok(result.timestamp);
+    assert.equal(result.mandate_id, undefined, 'mandate_id should be omitted when not applicable');
   });
 
   await t.test('3. Should DENY request with merchant not in allowed_merchants list', () => {
@@ -50,8 +56,11 @@ test('Policy Engine - Step 2 Pure Rule Evaluation', async (t) => {
 
     const result = evaluate(request, fakeAgentState);
     assert.equal(result.decision, 'DENY');
+    assert.equal(result.stage, 'POLICY_ENGINE');
+    assert.equal(result.reason_code, 'MERCHANT_NOT_ALLOWED');
     assert.equal(result.ruleViolated, 'MERCHANT_CHECK');
-    assert.match(result.reason, /MERCHANT_NOT_ALLOWED/);
+    assert.ok(result.explanation.includes('Unauthorized Luxury Mall'));
+    assert.ok(result.suggested_fix.includes('allowed_merchants'));
   });
 
   await t.test('4. Should DENY request when velocity limit is reached in the hour', () => {
@@ -68,8 +77,11 @@ test('Policy Engine - Step 2 Pure Rule Evaluation', async (t) => {
 
     const result = evaluate(request, saturatedAgentState);
     assert.equal(result.decision, 'DENY');
+    assert.equal(result.stage, 'POLICY_ENGINE');
+    assert.equal(result.reason_code, 'VELOCITY_LIMIT_EXCEEDED');
     assert.equal(result.ruleViolated, 'VELOCITY_CHECK');
-    assert.match(result.reason, /VELOCITY_LIMIT_EXCEEDED/);
+    assert.ok(result.explanation.includes('5'));
+    assert.ok(result.suggested_fix.includes('velocity'));
   });
 
   await t.test('5. Should DENY request with zero or negative amount', () => {
@@ -80,8 +92,10 @@ test('Policy Engine - Step 2 Pure Rule Evaluation', async (t) => {
 
     const result = evaluate(request, fakeAgentState);
     assert.equal(result.decision, 'DENY');
+    assert.equal(result.stage, 'POLICY_ENGINE');
+    assert.equal(result.reason_code, 'INVALID_AMOUNT');
     assert.equal(result.ruleViolated, 'SANITY_CHECK');
-    assert.match(result.reason, /INVALID_AMOUNT/);
+    assert.ok(result.explanation.includes('-500'));
   });
 
   await t.test('6. Should correctly evaluate string-typed numeric values from Postgres/Supabase JSON', () => {
@@ -116,9 +130,10 @@ test('Policy Engine - Step 2 Pure Rule Evaluation', async (t) => {
 
     const overBudgetResult = evaluate(overBudgetRequest, stringAgentState);
     assert.equal(overBudgetResult.decision, 'DENY');
+    assert.equal(overBudgetResult.stage, 'POLICY_ENGINE');
+    assert.equal(overBudgetResult.reason_code, 'BUDGET_EXCEEDED');
     assert.equal(overBudgetResult.ruleViolated, 'BUDGET_CHECK');
-    assert.match(overBudgetResult.reason, /BUDGET_EXCEEDED/);
-    assert.match(overBudgetResult.reason, /₹25000/);
-    assert.match(overBudgetResult.reason, /₹21000/);
+    assert.ok(overBudgetResult.explanation.includes('25000'));
+    assert.ok(overBudgetResult.explanation.includes('21000'));
   });
 });

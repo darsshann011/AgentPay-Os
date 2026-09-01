@@ -6,6 +6,8 @@ require('dotenv').config();
 const agentRequestsRouter = require('./routes/agentRequests');
 const webhooksRouter = require('./routes/webhooks');
 const auditRouter = require('./routes/audit');
+const mandatesRouter = require('./routes/mandates');
+const catalogRouter = require('./routes/catalog');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -45,6 +47,8 @@ app.get('/api/health', (req, res) => {
 app.use('/api/agent-requests', agentRequestsRouter);
 app.use('/api/webhooks', webhooksRouter);
 app.use('/api/audit', auditRouter);
+app.use('/api/mandates', mandatesRouter);
+app.use('/api/catalog', catalogRouter);
 
 // Centralized error handler
 app.use((err, req, res, next) => {
@@ -64,6 +68,7 @@ if (require.main === module) {
     console.log(`🔌 Supabase URL:  ${process.env.SUPABASE_URL || 'Not configured (In-Memory)'}`);
     console.log(`📡 Health Check: http://localhost:${PORT}/api/health`);
     console.log(`📊 Audit API:    http://localhost:${PORT}/api/audit`);
+    console.log(`📜 Mandates API: http://localhost:${PORT}/api/mandates`);
     console.log(`🤖 Agent API:    http://localhost:${PORT}/api/agent-requests`);
     console.log(`⚡ Webhook API:  http://localhost:${PORT}/api/webhooks/razorpay`);
     console.log(`========================================================`);

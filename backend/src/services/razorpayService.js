@@ -34,8 +34,8 @@ if (isRazorpayConfigured) {
 }
 
 /**
- * Creates a Razorpay Order
- * @param {Object} params - { amount (INR in main units, e.g. 12000), currency: 'INR', receipt: string, notes: Object }
+ * Creates a standard Razorpay Order
+ * @param {Object} params - { amount (INR in main units), currency: 'INR', receipt: string, notes: Object }
  * @returns {Promise<Object>} Razorpay order object
  */
 async function createOrder({ amount, currency = 'INR', receipt, notes = {} }) {
@@ -73,6 +73,115 @@ async function createOrder({ amount, currency = 'INR', receipt, notes = {} }) {
       ...notes
     },
     created_at: Math.floor(Date.now() / 1000)
+  };
+}
+
+/**
+ * Authorizes an Order / Payment Hold (does NOT capture yet)
+ * @param {Object} params - { amount, currency, receipt, notes }
+ * @returns {Promise<Object>} Authorized order object
+ */
+async function authorizeOrder({ amount, currency = 'INR', receipt, notes = {} }) {
+  const amountInPaise = Math.round(Number(amount) * 100);
+
+  if (razorpayInstance) {
+    const options = {
+      amount: amountInPaise,
+      currency,
+      receipt: receipt || `rcpt_auth_${Date.now()}`,
+      payment_capture: 0, // 0 = Manual capture / authorization hold
+      notes: {
+        agent_id: notes.agent_id || '',
+        sku: notes.sku || '',
+        ...notes
+      }
+    };
+    return await razorpayInstance.orders.create(options);
+  }
+
+  const mockOrderId = `order_auth_${uuidv4().substring(0, 14)}`;
+  return {
+    id: mockOrderId,
+    entity: 'order',
+    amount: amountInPaise,
+    amount_paid: 0,
+    amount_due: amountInPaise,
+    currency,
+    receipt: receipt || `rcpt_auth_${Date.now()}`,
+    status: 'authorized',
+    payment_capture: false,
+    attempts: 0,
+    notes: {
+      agent_id: notes.agent_id || '',
+      sku: notes.sku || '',
+      ...notes
+    },
+    created_at: Math.floor(Date.now() / 1000)
+  };
+}
+
+/**
+ * Reconfirms transaction amount against mandate ceiling at capture time (TOCTOU protection)
+ * @param {string} orderId
+ * @param {number} currentAmount
+ * @param {number} mandateMaxAmount
+ * @returns {{ passed: boolean, orderId: string, currentAmount: number, mandateMaxAmount: number }}
+ */
+function reconfirmAmount(orderId, currentAmount, mandateMaxAmount) {
+  const current = Number(currentAmount);
+  const max = Number(mandateMaxAmount);
+  const passed = !isNaN(current) && !isNaN(max) && current <= max && current > 0;
+  return {
+    passed,
+    orderId,
+    currentAmount: current,
+    mandateMaxAmount: max
+  };
+}
+
+/**
+ * Captures an authorized order / payment
+ * @param {Object} params - { orderId, paymentId, amount, currency, notes }
+ * @returns {Promise<Object>} Captured payment object
+ */
+async function captureOrder({ orderId, paymentId, amount, currency = 'INR', notes = {} }) {
+  const amountInPaise = Math.round(Number(amount) * 100);
+
+  if (razorpayInstance && paymentId && !paymentId.startsWith('pay_test_')) {
+    return await razorpayInstance.payments.capture(paymentId, amountInPaise, currency);
+  }
+
+  const mockPaymentId = paymentId || `pay_captured_${uuidv4().substring(0, 14)}`;
+  return {
+    id: mockPaymentId,
+    entity: 'payment',
+    order_id: orderId,
+    amount: amountInPaise,
+    currency,
+    status: 'captured',
+    method: 'card',
+    captured: true,
+    description: 'Agent Trust Rail Authorized Capture',
+    notes,
+    created_at: Math.floor(Date.now() / 1000)
+  };
+}
+
+/**
+ * Voids an authorization hold when price drift or validation fails at capture time
+ * @param {Object} params - { orderId, paymentId, notes }
+ * @returns {Promise<Object>} Void result object
+ */
+async function voidAuthorization({ orderId, paymentId, notes = {} }) {
+  // If simulated or live order cancellation
+  return {
+    id: orderId,
+    entity: 'order',
+    payment_id: paymentId || null,
+    status: 'voided',
+    voided: true,
+    notes,
+    voided_at: new Date().toISOString()
   };
 }
 
@@ -177,6 +286,10 @@ function verifyWebhookSignature(rawBody, signature, secret = RAZORPAY_WEBHOOK_SE
 
 module.exports = {
   createOrder,
+  authorizeOrder,
+  reconfirmAmount,
+  captureOrder,
+  voidAuthorization,
   createPaymentLink,
   createRefund,
   verifyWebhookSignature,

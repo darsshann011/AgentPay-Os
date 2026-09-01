@@ -4,6 +4,7 @@ const {
   getAuditLogs,
   listAgents,
   getAgent,
+  verifyAuditChain,
   resetMemoryStore
 } = require('../db/supabaseClient');
 
@@ -23,6 +24,26 @@ router.get('/', async (req, res) => {
   } catch (err) {
     console.error('[Audit API Error]', err);
     return res.status(500).json({ error: true, message: err.message });
+  }
+});
+
+/**
+ * GET /api/audit/verify-chain
+ * Validates the cryptographic integrity of the tamper-evident audit log hash chain.
+ * Walks the full audit log in order, recomputing each entry_hash from that row's fields +
+ * the previous row's stored entry_hash.
+ */
+router.get('/verify-chain', async (req, res) => {
+  try {
+    const verification = await verifyAuditChain();
+    return res.status(200).json(verification);
+  } catch (err) {
+    console.error('[Audit Verify Chain Error]', err);
+    return res.status(500).json({
+      valid: false,
+      error: true,
+      message: err.message
+    });
   }
 });
 
@@ -64,7 +85,7 @@ router.get('/summary', async (req, res) => {
         totalAllowed++;
         if (log.detail?.amount) totalVolumeAllowed += Number(log.detail.amount);
       }
-      if (log.event_type === 'DENIED') totalDenied++;
+      if (log.event_type === 'DENIED' || log.event_type === 'MANDATE_DENIED') totalDenied++;
       if (log.event_type === 'DUPLICATE_BLOCKED') totalBlockedDuplicates++;
     }
 

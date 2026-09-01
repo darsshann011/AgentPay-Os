@@ -30,13 +30,35 @@ create table if not exists transactions (
   updated_at timestamptz default now()
 );
 
--- 3. Audit Log Table
+-- 3. Audit Log Table (Tamper-Evident Hash Chaining)
 create table if not exists audit_log (
   id uuid primary key default gen_random_uuid(),
   transaction_id uuid references transactions(id) on delete set null,
-  event_type text not null, -- AGENT_REQUESTED | POLICY_EVALUATED | PAYMENT_CREATED | WEBHOOK_RECEIVED | DUPLICATE_BLOCKED | DENIED
+  event_type text not null, -- AGENT_REQUESTED | POLICY_EVALUATED | PAYMENT_CREATED | WEBHOOK_RECEIVED | DUPLICATE_BLOCKED | DENIED | MANDATE_ISSUED | MANDATE_VERIFIED | MANDATE_DENIED | AUTHORIZED | CAPTURED | VOIDED
   detail jsonb,
-  created_at timestamptz default now()
+  created_at timestamptz default now(),
+  prev_hash text,
+  entry_hash text
+);
+
+-- Migration safety for existing audit_log tables
+alter table if exists audit_log add column if not exists prev_hash text;
+alter table if exists audit_log add column if not exists entry_hash text;
+
+-- 4. Mandates Table (Agent Trust Rail)
+create table if not exists mandates (
+  mandate_id uuid primary key default gen_random_uuid(),
+  agent_id uuid references agents(id) on delete cascade,
+  max_amount numeric not null,
+  merchant_category text not null,
+  nonce text unique not null,
+  nonce_used boolean default false,
+  webauthn_credential_id text not null,
+  webauthn_signature text not null,
+  webauthn_public_key text not null,
+  issued_at timestamptz default now(),
+  expires_at timestamptz not null,
+  status text default 'ACTIVE'
 );
 
 -- Indexes for fast lookup
@@ -44,6 +66,10 @@ create index if not exists idx_transactions_agent_id on transactions(agent_id);
 create index if not exists idx_transactions_idempotency on transactions(idempotency_key);
 create index if not exists idx_audit_log_transaction_id on audit_log(transaction_id);
 create index if not exists idx_audit_log_created_at on audit_log(created_at desc);
+create index if not exists idx_mandates_agent_id on mandates(agent_id);
+create index if not exists idx_mandates_nonce on mandates(nonce);
+create index if not exists idx_mandates_status on mandates(status);
+
 
 -- ========================================================
 -- ATOMIC ROW-LEVEL LOCKING FUNCTION (Race Condition Protection)
@@ -166,3 +192,79 @@ begin
   );
 end;
 $$;
+
+-- ========================================================
+-- STEP 3: Atomic Mandate Nonce Consumption (Agent Trust Rail)
+-- ========================================================
+-- Uses Postgres transaction with row-level locking (SELECT ... FOR UPDATE)
+-- to ensure single-use nonce consumption is strictly atomic and race-condition proof.
+
+create or replace function consume_mandate_nonce(
+  p_mandate_id uuid
+) returns jsonb
+language plpgsql
+as $$
+declare
+  v_mandate record;
+begin
+  -- 1. Acquire exclusive row lock on the mandate
+  select * into v_mandate
+  from mandates
+  where mandate_id = p_mandate_id
+  for update;
+
+  if not found then
+    return jsonb_build_object(
+      'success', false,
+      'reason_code', 'MANDATE_NOT_FOUND',
+      'explanation', 'Mandate does not exist',
+      'suggested_fix', 'Provide a valid mandate_id issued via POST /api/mandates/issue'
+    );
+  end if;
+
+  -- 2. Check if nonce has already been consumed (replay check)
+  if v_mandate.nonce_used = true then
+    return jsonb_build_object(
+      'success', false,
+      'reason_code', 'NONCE_ALREADY_USED',
+      'explanation', 'The single-use nonce for this mandate has already been consumed or replayed',
+      'suggested_fix', 'Issue a new mandate with a fresh cryptographic nonce to prevent replay attacks'
+    );
+  end if;
+
+  -- 3. Check if mandate has expired
+  if v_mandate.expires_at <= now() then
+    return jsonb_build_object(
+      'success', false,
+      'reason_code', 'MANDATE_EXPIRED',
+      'explanation', 'Mandate has expired',
+      'suggested_fix', 'Issue a fresh mandate with updated expiry window'
+    );
+  end if;
+
+  -- 4. Mark nonce as consumed atomically
+  update mandates
+  set nonce_used = true,
+      status = 'USED'
+  where mandate_id = p_mandate_id;
+
+  return jsonb_build_object(
+    'success', true,
+    'mandate_id', p_mandate_id,
+    'nonce', v_mandate.nonce,
+    'status', 'USED'
+  );
+end;
+$$;
+
+-- 5. Catalog Items Table (Agent Trust Rail Demo Catalog)
+create table if not exists catalog_items (
+  sku text primary key,
+  name text not null,
+  merchant text not null,
+  category text not null,
+  price numeric not null,
+  currency text default 'INR',
+  stock int default 0
+);
+
