@@ -61,6 +61,7 @@ if (require.main === module) {
   app.listen(PORT, () => {
     console.log(`========================================================`);
     console.log(`🛡️ AgentPay OS Policy Firewall running on port ${PORT}`);
+    console.log(`🔌 Supabase URL:  ${process.env.SUPABASE_URL || 'Not configured (In-Memory)'}`);
     console.log(`📡 Health Check: http://localhost:${PORT}/api/health`);
     console.log(`📊 Audit API:    http://localhost:${PORT}/api/audit`);
     console.log(`🤖 Agent API:    http://localhost:${PORT}/api/agent-requests`);

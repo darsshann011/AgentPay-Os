@@ -83,4 +83,42 @@ test('Policy Engine - Step 2 Pure Rule Evaluation', async (t) => {
     assert.equal(result.ruleViolated, 'SANITY_CHECK');
     assert.match(result.reason, /INVALID_AMOUNT/);
   });
+
+  await t.test('6. Should correctly evaluate string-typed numeric values from Postgres/Supabase JSON', () => {
+    // Supabase returns numeric columns as strings
+    const stringAgentState = {
+      id: 'test-agent-str',
+      name: 'TravelBot Agent',
+      budget_total: '50000.00',
+      budget_remaining: '21000.00',
+      allowed_merchants: ['Hotel Vendor A', 'Cab Vendor B'],
+      velocity_limit: '5',
+      recentTxCount: '2'
+    };
+
+    // Valid purchase within budget with string amounts
+    const validRequest = {
+      amount: '12000',
+      merchant: 'Hotel Vendor A',
+      sku: 'HOTEL-STAY-2N'
+    };
+
+    const validResult = evaluate(validRequest, stringAgentState);
+    assert.equal(validResult.decision, 'ALLOW');
+    assert.match(validResult.reason, /POLICY_PASSED/);
+
+    // Over budget purchase with string amounts
+    const overBudgetRequest = {
+      amount: '25000.00',
+      merchant: 'Hotel Vendor A',
+      sku: 'HOTEL-STAY-5N'
+    };
+
+    const overBudgetResult = evaluate(overBudgetRequest, stringAgentState);
+    assert.equal(overBudgetResult.decision, 'DENY');
+    assert.equal(overBudgetResult.ruleViolated, 'BUDGET_CHECK');
+    assert.match(overBudgetResult.reason, /BUDGET_EXCEEDED/);
+    assert.match(overBudgetResult.reason, /₹25000/);
+    assert.match(overBudgetResult.reason, /₹21000/);
+  });
 });

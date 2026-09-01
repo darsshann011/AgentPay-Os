@@ -1,0 +1,88 @@
+========================================================
+BUG FIX PROMPT #2 — AgentPay OS
+Paste this into Antigravity
+========================================================
+
+I checked the Supabase `agents` table directly. The agent with id
+'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' (name: "TravelBot Agent",
+budget_remaining: 21000) DOES exist. So the AGENT_NOT_FOUND error is NOT
+caused by missing seed data — it is a bug in the lookup code itself.
+
+Please fix the following three things:
+
+--------------------------------------------------------
+FIX 1: Find and fix the actual lookup bug
+--------------------------------------------------------
+
+1. Locate the exact function that queries the `agents` table by id (likely
+   in policyEngine.js or a db/agentService.js file).
+
+2. Add explicit console logging right before and after this query that
+   prints: the exact agent_id being queried, the Supabase project URL
+   currently in use (from env), and the raw result/error returned by the
+   query — do not let any catch block swallow the real error silently.
+
+3. Check for these specific likely causes and fix whichever applies:
+   - The backend's SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY in .env might
+     point to a different Supabase project than the one I'm viewing in the
+     dashboard. Print the URL being used at server startup and confirm it
+     matches.
+   - Check if the query uses .single() — if the query has any issue
+     returning more than one row or zero rows, .single() throws an error
+     that might be getting caught and converted into a generic
+     "AGENT_NOT_FOUND" without showing the real cause.
+   - Check for column name mismatches (e.g. querying `id` vs `agent_id`,
+     or a typo in the table name).
+   - Check if there's a caching layer or connection pooling issue causing
+     stale reads.
+
+4. Once the root cause is identified and fixed, remove the debug logging
+   (or reduce it to a single clean log line) and re-run the 3-act demo to
+   confirm POLICY_EVALUATED events now appear correctly.
+
+--------------------------------------------------------
+FIX 2: Clean up and isolate test data from demo data
+--------------------------------------------------------
+
+The `agents` table currently has duplicate rows from repeated test runs
+("Concurrency Test Agent", "Idempotency Test Agent", "Executive Assistant
+Bot", "High Concurrency Agent" each appear multiple times).
+
+1. Add a `teardown`/cleanup step to the test suite (e.g. in a
+   `beforeEach`/`afterEach` or global test setup) that deletes any agents
+   it creates after each test run, OR have tests create agents with a
+   clearly marked prefix (e.g. "TEST_") and add a cleanup script
+   `npm run cleanup:test-data` that deletes all agents where name starts
+   with "TEST_".
+
+2. Ensure the demo/seed script for "TravelBot Agent" (and any other
+   demo-specific agents) is idempotent — running it twice should not create
+   duplicates. Use an upsert (insert ... on conflict do update) keyed on a
+   fixed, known id or name, rather than always inserting a new row.
+
+3. After this fix, clean the current `agents` table of duplicate test rows
+   manually via Supabase, keeping only the real demo agents.
+
+--------------------------------------------------------
+FIX 3: Ensure numeric fields are explicitly parsed before comparison
+--------------------------------------------------------
+
+Supabase returns Postgres `numeric` columns (budget_total, budget_remaining)
+as strings in JSON, not numbers.
+
+1. In policyEngine.js, wherever budget_remaining or amount values are
+   compared, explicitly convert with Number() or parseFloat() before doing
+   any arithmetic or comparison — do not rely on implicit JS type coercion.
+
+2. Add a unit test that passes a budget_remaining value as a string (as it
+   would actually arrive from Supabase) and confirms the policy engine
+   still evaluates budget checks correctly.
+
+--------------------------------------------------------
+FINAL STEP
+--------------------------------------------------------
+
+After all three fixes, restart the backend fresh, re-run the full 3-act
+demo cold, and paste back the new audit_log output so we can confirm
+POLICY_EVALUATED events with real ALLOW/DENY reasons are now showing up
+correctly instead of AGENT_NOT_FOUND.

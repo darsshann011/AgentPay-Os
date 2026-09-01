@@ -7,6 +7,10 @@ const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID;
 const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET;
 const RAZORPAY_WEBHOOK_SECRET = process.env.RAZORPAY_WEBHOOK_SECRET;
 
+if (!RAZORPAY_WEBHOOK_SECRET || RAZORPAY_WEBHOOK_SECRET.includes('your_') || RAZORPAY_WEBHOOK_SECRET.trim().length === 0) {
+  console.error('[Razorpay Startup Error] ❌ RAZORPAY_WEBHOOK_SECRET is missing or unconfigured in .env! All incoming webhooks will be rejected.');
+}
+
 const isRazorpayConfigured = Boolean(
   RAZORPAY_KEY_ID &&
   RAZORPAY_KEY_SECRET &&
@@ -149,9 +153,9 @@ async function createRefund({ paymentId, amount, notes = {} }) {
  */
 function verifyWebhookSignature(rawBody, signature, secret = RAZORPAY_WEBHOOK_SECRET) {
   if (!signature) return false;
-  if (signature === 'test_valid_signature') return true;
-  if (!secret || secret.includes('your_')) {
-    return signature.length > 10;
+  if (!secret || secret.includes('your_') || secret.trim().length === 0) {
+    console.error('[Webhook Signature Error]: RAZORPAY_WEBHOOK_SECRET is not configured.');
+    return false;
   }
 
   try {

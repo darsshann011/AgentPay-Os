@@ -60,11 +60,30 @@ async function acquireAgentLock(agentId) {
   };
 }
 
+// Helper to ensure numeric Postgres columns are explicitly converted to Numbers in JS
+function formatAgentRecord(agent) {
+  if (!agent) return null;
+  return {
+    id: agent.id,
+    name: agent.name,
+    budget_total: Number(agent.budget_total),
+    budget_remaining: Number(agent.budget_remaining),
+    allowed_merchants: Array.isArray(agent.allowed_merchants)
+      ? agent.allowed_merchants
+      : (typeof agent.allowed_merchants === 'string' ? JSON.parse(agent.allowed_merchants) : []),
+    velocity_limit: Number(agent.velocity_limit || 5),
+    created_at: agent.created_at
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Database API Layer
 // ---------------------------------------------------------------------------
 
 async function getAgent(agentId) {
+  const targetId = agentId || DEFAULT_TRAVELBOT_ID;
+  console.log(`[Supabase Agent Lookup] 🔍 Querying agent_id: '${targetId}' | Supabase URL: '${SUPABASE_URL || 'in-memory'}'`);
+
   if (supabase) {
     try {
       // 1. If explicit agentId is supplied, lookup by ID
@@ -75,11 +94,13 @@ async function getAgent(agentId) {
           .eq('id', agentId)
           .maybeSingle();
 
+        console.log(`[Supabase Agent Lookup] 📋 Query for '${agentId}' raw result:`, data ? `Found (${data.name})` : 'Not Found', error ? `| Error: ${error.message}` : '');
+
         if (error) {
           console.error(`[Supabase Error in getAgent('${agentId}')]:`, error.message, error.details || '');
         }
 
-        if (data) return data;
+        if (data) return formatAgentRecord(data);
       }
 
       // 2. If no agentId or agent with that ID wasn't found, look for TravelBot Agent
@@ -89,9 +110,13 @@ async function getAgent(agentId) {
         .eq('id', DEFAULT_TRAVELBOT_ID)
         .maybeSingle();
 
-      if (travelBot) return travelBot;
+      if (tbErr) {
+        console.error('[Supabase Error in getAgent TravelBot lookup]:', tbErr.message);
+      }
 
-      // 3. Otherwise find the first available agent
+      if (travelBot) return formatAgentRecord(travelBot);
+
+      // 3. Otherwise find the first available agent named 'TravelBot Agent'
       const { data: firstAgent, error: listErr } = await supabase
         .from('agents')
         .select('*')
@@ -100,9 +125,19 @@ async function getAgent(agentId) {
         .limit(1)
         .maybeSingle();
 
-      if (firstAgent) return firstAgent;
+      if (firstAgent) return formatAgentRecord(firstAgent);
 
-      // 3. If agents table is completely empty, auto-seed default TravelBot agent into Supabase
+      // 4. If agents table has other agents, return the first agent
+      const { data: anyAgents, error: anyErr } = await supabase
+        .from('agents')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (anyAgents) return formatAgentRecord(anyAgents);
+
+      // 5. If agents table is completely empty, auto-seed default TravelBot agent into Supabase
       console.log('[Supabase] Agents table is empty. Auto-seeding default TravelBot Agent...');
       const defaultAgent = {
         id: agentId || DEFAULT_TRAVELBOT_ID,
@@ -115,26 +150,27 @@ async function getAgent(agentId) {
 
       const { data: seededAgent, error: seedErr } = await supabase
         .from('agents')
-        .upsert(defaultAgent)
+        .upsert(defaultAgent, { onConflict: 'id' })
         .select()
         .single();
 
       if (seedErr) {
         console.error('[Supabase Auto-Seed Error]:', seedErr.message);
-        return defaultAgent;
+        return formatAgentRecord(defaultAgent);
       }
 
-      return seededAgent;
+      return formatAgentRecord(seededAgent);
     } catch (err) {
       console.error('[Supabase getAgent Exception]:', err.message);
     }
   }
 
-  return (
-    (agentId && memoryStore.agents.get(agentId)) ||
+  const inMemAgent = (agentId && memoryStore.agents.get(agentId)) ||
+    memoryStore.agents.get(DEFAULT_TRAVELBOT_ID) ||
     Array.from(memoryStore.agents.values())[0] ||
-    null
-  );
+    null;
+
+  return formatAgentRecord(inMemAgent);
 }
 
 async function listAgents() {
@@ -150,8 +186,9 @@ async function listAgents() {
       }
 
       if (data && data.length > 0) {
+        const formatted = data.map(formatAgentRecord);
         // Place TravelBot at index 0
-        return data.sort((a, b) => {
+        return formatted.sort((a, b) => {
           if (a.id === DEFAULT_TRAVELBOT_ID || a.name === 'TravelBot Agent') return -1;
           if (b.id === DEFAULT_TRAVELBOT_ID || b.name === 'TravelBot Agent') return 1;
           return 0;
@@ -165,7 +202,7 @@ async function listAgents() {
       console.error('[Supabase listAgents Exception]:', err.message);
     }
   }
-  return Array.from(memoryStore.agents.values());
+  return Array.from(memoryStore.agents.values()).map(formatAgentRecord);
 }
 
 async function createAgent(agentData) {
@@ -190,18 +227,23 @@ async function createAgent(agentData) {
       console.error('[Supabase Error in createAgent]:', error.message);
       throw error;
     }
-    return data;
+    return formatAgentRecord(data);
   }
 
   memoryStore.agents.set(id, agent);
-  return agent;
+  return formatAgentRecord(agent);
 }
 
 async function updateAgent(agentId, updates) {
+  const sanitizedUpdates = { ...updates };
+  if (sanitizedUpdates.budget_total !== undefined) sanitizedUpdates.budget_total = Number(sanitizedUpdates.budget_total);
+  if (sanitizedUpdates.budget_remaining !== undefined) sanitizedUpdates.budget_remaining = Number(sanitizedUpdates.budget_remaining);
+  if (sanitizedUpdates.velocity_limit !== undefined) sanitizedUpdates.velocity_limit = Number(sanitizedUpdates.velocity_limit);
+
   if (supabase) {
     const { data, error } = await supabase
       .from('agents')
-      .update(updates)
+      .update(sanitizedUpdates)
       .eq('id', agentId)
       .select()
       .single();
@@ -209,14 +251,89 @@ async function updateAgent(agentId, updates) {
       console.error('[Supabase Error in updateAgent]:', error.message);
       throw error;
     }
-    return data;
+    return formatAgentRecord(data);
   }
 
   const existing = memoryStore.agents.get(agentId);
   if (!existing) return null;
-  const updated = { ...existing, ...updates };
+  const updated = { ...existing, ...sanitizedUpdates };
   memoryStore.agents.set(agentId, updated);
-  return updated;
+  return formatAgentRecord(updated);
+}
+
+async function deleteAgent(agentId) {
+  if (!agentId) return false;
+  if (supabase) {
+    try {
+      const { error } = await supabase
+        .from('agents')
+        .delete()
+        .eq('id', agentId);
+      if (error) {
+        console.error(`[Supabase Error in deleteAgent('${agentId}')]:`, error.message);
+        return false;
+      }
+      return true;
+    } catch (e) {
+      console.error('[Supabase deleteAgent Exception]:', e.message);
+      return false;
+    }
+  }
+  return memoryStore.agents.delete(agentId);
+}
+
+async function deleteTestAgents() {
+  const testNames = [
+    'Concurrency Test Agent',
+    'Idempotency Test Agent',
+    'Executive Assistant Bot',
+    'High Concurrency Agent',
+    'Webhook Agent'
+  ];
+
+  let deletedCount = 0;
+
+  if (supabase) {
+    try {
+      // Delete agents where name starts with TEST_
+      const { data: prefixData, error: prefixErr } = await supabase
+        .from('agents')
+        .delete()
+        .like('name', 'TEST_%')
+        .select('id');
+
+      if (!prefixErr && prefixData) {
+        deletedCount += prefixData.length;
+      }
+
+      // Delete known legacy test agent names
+      for (const name of testNames) {
+        const { data: namedData, error: namedErr } = await supabase
+          .from('agents')
+          .delete()
+          .eq('name', name)
+          .select('id');
+
+        if (!namedErr && namedData) {
+          deletedCount += namedData.length;
+        }
+      }
+
+      console.log(`[Supabase Test Cleanup] Deleted ${deletedCount} test agent rows.`);
+    } catch (e) {
+      console.error('[Supabase Test Cleanup Exception]:', e.message);
+    }
+  }
+
+  // Also clean memory store
+  for (const [id, agent] of memoryStore.agents.entries()) {
+    if (id !== DEFAULT_TRAVELBOT_ID && (agent.name.startsWith('TEST_') || testNames.includes(agent.name))) {
+      memoryStore.agents.delete(id);
+      deletedCount++;
+    }
+  }
+
+  return deletedCount;
 }
 
 async function getTransaction(txId) {
@@ -586,6 +703,9 @@ module.exports = {
   listAgents,
   createAgent,
   updateAgent,
+  deleteAgent,
+  deleteTestAgents,
+  formatAgentRecord,
   getTransaction,
   getTransactionByIdempotencyKey,
   createTransaction,

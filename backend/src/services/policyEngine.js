@@ -16,13 +16,13 @@ const DEFAULT_POLICY_RULES = [
     description: 'Amount must be a positive number and merchant must be specified',
     check: (req, state) => {
       const amount = Number(req?.amount);
-      const hasValidAmount = !isNaN(amount) && amount > 0;
+      const hasValidAmount = !isNaN(amount) && isFinite(amount) && amount > 0;
       const hasMerchant = typeof req?.merchant === 'string' && req.merchant.trim().length > 0;
       return hasValidAmount && hasMerchant;
     },
     failReason: (req, state) => {
       const amount = Number(req?.amount);
-      if (isNaN(amount) || amount <= 0) return 'INVALID_AMOUNT: Amount must be greater than 0';
+      if (isNaN(amount) || !isFinite(amount) || amount <= 0) return 'INVALID_AMOUNT: Amount must be greater than 0';
       if (!req?.merchant || req.merchant.trim().length === 0) return 'MISSING_MERCHANT: Merchant name is required';
       return 'INVALID_REQUEST: Request payload failed sanity check';
     }
@@ -36,7 +36,9 @@ const DEFAULT_POLICY_RULES = [
       return !isNaN(amount) && !isNaN(budgetRemaining) && amount <= budgetRemaining;
     },
     failReason: (req, state) => {
-      return `BUDGET_EXCEEDED: Requested amount ₹${req.amount} exceeds remaining budget ₹${state.budget_remaining}`;
+      const amount = Number(req?.amount);
+      const budgetRemaining = Number(state?.budget_remaining);
+      return `BUDGET_EXCEEDED: Requested amount ₹${amount} exceeds remaining budget ₹${budgetRemaining}`;
     }
   },
   {
@@ -61,11 +63,13 @@ const DEFAULT_POLICY_RULES = [
     description: 'Agent transaction count in the last hour must be below velocity limit',
     check: (req, state) => {
       const recentCount = Number(state?.recentTxCount || 0);
-      const velocityLimit = Number(state?.velocity_limit || 5);
-      return recentCount < velocityLimit;
+      const velocityLimit = Number(state?.velocity_limit !== undefined ? state.velocity_limit : 5);
+      return !isNaN(recentCount) && !isNaN(velocityLimit) && recentCount < velocityLimit;
     },
     failReason: (req, state) => {
-      return `VELOCITY_LIMIT_EXCEEDED: Agent has executed ${state.recentTxCount || 0} transactions in the last hour (Limit: ${state.velocity_limit || 5})`;
+      const recentCount = Number(state?.recentTxCount || 0);
+      const velocityLimit = Number(state?.velocity_limit !== undefined ? state.velocity_limit : 5);
+      return `VELOCITY_LIMIT_EXCEEDED: Agent has executed ${recentCount} transactions in the last hour (Limit: ${velocityLimit})`;
     }
   }
 ];

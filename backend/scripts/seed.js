@@ -40,7 +40,7 @@ async function seedData() {
       console.log('[Seed] Upserting TravelBot Agent in Supabase Postgres...');
       const { data, error } = await supabase
         .from('agents')
-        .upsert(travelBotData)
+        .upsert(travelBotData, { onConflict: 'id' })
         .select()
         .single();
 
