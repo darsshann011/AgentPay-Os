@@ -8,7 +8,8 @@ const { isoBase64URL, isoCBOR } = require('@simplewebauthn/server/helpers');
 const {
   issueMandate,
   verifyMandate,
-  getVerifiedToken
+  getVerifiedToken,
+  clearMandateTimers
 } = require('../src/services/mandateService');
 
 const {
@@ -171,8 +172,12 @@ test('Nonce Replay & Atomic Race Condition Protection - Step 3 Verification', as
 
   t.after(async () => {
     if (server) {
+      if (typeof server.closeAllConnections === 'function') {
+        server.closeAllConnections();
+      }
       await new Promise((resolve) => server.close(resolve));
     }
+    clearMandateTimers();
   });
 
   await t.test('1. Two concurrent POST /api/mandates/verify requests: exactly 1 succeeds and 1 fails with NONCE_ALREADY_USED', async () => {

@@ -87,25 +87,41 @@ DEFAULT_CATALOG_ITEMS.forEach((item) => {
   memoryStore.catalog.set(item.sku, { ...item });
 });
 
-// Row-level lock acquisition helper for in-memory store
+// Promise-queue based mutex locks per agent and mandate ID
+const agentLockQueues = new Map();
+const mandateLockQueues = new Map();
+
 async function acquireAgentLock(agentId) {
-  while (memoryStore.agentLocks.get(agentId)) {
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  memoryStore.agentLocks.set(agentId, true);
+  const currentPromise = agentLockQueues.get(agentId) || Promise.resolve();
+  let release;
+  const nextPromise = new Promise((resolve) => {
+    release = resolve;
+  });
+  // Chain so the next caller waits for this lock to be released
+  agentLockQueues.set(agentId, currentPromise.then(() => nextPromise, () => nextPromise));
+  await currentPromise;
   return () => {
-    memoryStore.agentLocks.set(agentId, false);
+    release();
+    if (agentLockQueues.get(agentId) === nextPromise) {
+      agentLockQueues.delete(agentId);
+    }
   };
 }
 
-// Row-level lock acquisition helper for mandates in-memory store
+// Row-level lock acquisition helper for mandates
 async function acquireMandateLock(mandateId) {
-  while (memoryStore.mandateLocks.get(mandateId)) {
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  memoryStore.mandateLocks.set(mandateId, true);
+  const currentPromise = mandateLockQueues.get(mandateId) || Promise.resolve();
+  let release;
+  const nextPromise = new Promise((resolve) => {
+    release = resolve;
+  });
+  mandateLockQueues.set(mandateId, currentPromise.then(() => nextPromise, () => nextPromise));
+  await currentPromise;
   return () => {
-    memoryStore.mandateLocks.set(mandateId, false);
+    release();
+    if (mandateLockQueues.get(mandateId) === nextPromise) {
+      mandateLockQueues.delete(mandateId);
+    }
   };
 }
 
@@ -372,6 +388,12 @@ async function deleteTestAgents() {
 
   if (supabase) {
     try {
+      // Find all test agent IDs
+      const { data: prefixAgents } = await supabase.from('agents').select('id').like('name', 'TEST_%');
+      const { data: namedAgents } = await supabase.from('agents').select('id').in('name', testNames);
+      const allTestAgents = [...(prefixAgents || []), ...(namedAgents || [])];
+
+
       // Delete agents where name starts with TEST_
       const { data: prefixData, error: prefixErr } = await supabase
         .from('agents')
@@ -530,7 +552,7 @@ function canonicalJson(obj) {
   if (Array.isArray(obj)) {
     return '[' + obj.map(canonicalJson).join(',') + ']';
   }
-  const sortedKeys = Object.keys(obj).sort();
+  const sortedKeys = Object.keys(obj).filter(key => obj[key] !== undefined).sort();
   return '{' + sortedKeys.map(key => JSON.stringify(key) + ':' + canonicalJson(obj[key])).join(',') + '}';
 }
 
@@ -554,35 +576,49 @@ function computeAuditHash(prevHash, entry) {
     .digest('hex');
 }
 
-async function addAuditLog(transactionId, eventType, detail = {}) {
+async function addAuditLog(transactionId, eventType, detail = {}, options = {}) {
   const release = await acquireAuditLock();
   try {
     let prevHash = 'GENESIS';
+    const testRunId = options.test_run_id || detail?.test_run_id;
 
     if (supabase) {
       try {
-        const { data: latestEntry, error: latestErr } = await supabase
+        let query = supabase
           .from('audit_log')
-          .select('entry_hash')
-          .order('created_at', { ascending: false })
+          .select('entry_hash, detail')
+          .order('created_at', { ascending: false });
+
+        if (testRunId) {
+          query = query.filter('detail->>test_run_id', 'eq', testRunId);
+        }
+
+        const { data: latestEntry, error: latestErr } = await query
           .limit(1)
           .maybeSingle();
+
         if (!latestErr && latestEntry && latestEntry.entry_hash) {
           prevHash = latestEntry.entry_hash;
         } else {
-          const latestMem = memoryStore.audit_log[0];
+          const latestMem = testRunId
+            ? memoryStore.audit_log.find(m => m.detail?.test_run_id === testRunId)
+            : memoryStore.audit_log[0];
           if (latestMem && latestMem.entry_hash) {
             prevHash = latestMem.entry_hash;
           }
         }
       } catch (e) {
-        const latestMem = memoryStore.audit_log[0];
+        const latestMem = testRunId
+          ? memoryStore.audit_log.find(m => m.detail?.test_run_id === testRunId)
+          : memoryStore.audit_log[0];
         if (latestMem && latestMem.entry_hash) {
           prevHash = latestMem.entry_hash;
         }
       }
     } else {
-      const latestMem = memoryStore.audit_log[0];
+      const latestMem = testRunId
+        ? memoryStore.audit_log.find(m => m.detail?.test_run_id === testRunId)
+        : memoryStore.audit_log[0];
       if (latestMem && latestMem.entry_hash) {
         prevHash = latestMem.entry_hash;
       }
@@ -590,11 +626,15 @@ async function addAuditLog(transactionId, eventType, detail = {}) {
 
     const id = uuidv4();
     const createdAt = new Date().toISOString();
+    const finalDetail = testRunId && !detail?.test_run_id
+      ? { ...detail, test_run_id: testRunId }
+      : (detail || {});
+
     const entryHash = computeAuditHash(prevHash, {
       id,
       transaction_id: transactionId || null,
       event_type: eventType,
-      detail,
+      detail: finalDetail,
       created_at: createdAt
     });
 
@@ -602,7 +642,7 @@ async function addAuditLog(transactionId, eventType, detail = {}) {
       id,
       transaction_id: transactionId || null,
       event_type: eventType,
-      detail,
+      detail: finalDetail,
       created_at: createdAt,
       prev_hash: prevHash,
       entry_hash: entryHash
@@ -690,26 +730,111 @@ async function getAuditLogs(limit = 100) {
 }
 
 /**
- * Validates the full audit log cryptographic hash chain in order
+ * Validates the full audit log cryptographic hash chain in order across the entire ledger
  * @returns {Promise<{ valid: boolean, count?: number, broken_at_entry_id?: string, expected_hash?: string, found_hash?: string, reason?: string, verified_at?: string }>}
  */
 async function verifyAuditChain() {
   let entries = [];
 
-  if (memoryStore.audit_log && memoryStore.audit_log.length > 0) {
-    entries = memoryStore.audit_log.slice().reverse();
-  } else if (supabase) {
+  if (supabase) {
     try {
       const { data, error } = await supabase
         .from('audit_log')
         .select('*')
         .order('created_at', { ascending: true });
 
-      if (!error && data && data.length > 0 && data[0].entry_hash) {
+      if (!error && Array.isArray(data)) {
         entries = data;
       }
     } catch (e) {
       console.error('[verifyAuditChain Supabase Exception]:', e.message);
+    }
+  }
+
+  if (entries.length === 0 && memoryStore.audit_log && memoryStore.audit_log.length > 0) {
+    entries = memoryStore.audit_log.slice().reverse();
+  }
+
+  if (entries.length === 0) {
+    return {
+      valid: true,
+      count: 0,
+      verified_at: new Date().toISOString()
+    };
+  }
+
+  let previousHash = 'GENESIS';
+
+  for (let i = 0; i < entries.length; i++) {
+    const row = entries[i];
+
+    // Check prev_hash
+    if (row.prev_hash !== previousHash) {
+      return {
+        valid: false,
+        broken_at_entry_id: row.id,
+        entry_index: i,
+        expected_prev_hash: previousHash,
+        found_prev_hash: row.prev_hash,
+        expected_hash: computeAuditHash(previousHash, row),
+        found_hash: row.entry_hash,
+        reason: 'PREV_HASH_MISMATCH'
+      };
+    }
+
+    // Check entry_hash
+    const expectedEntryHash = computeAuditHash(previousHash, row);
+    if (row.entry_hash !== expectedEntryHash) {
+      return {
+        valid: false,
+        broken_at_entry_id: row.id,
+        entry_index: i,
+        expected_hash: expectedEntryHash,
+        found_hash: row.entry_hash,
+        reason: 'ENTRY_HASH_MISMATCH'
+      };
+    }
+
+    previousHash = row.entry_hash;
+  }
+
+  return {
+    valid: true,
+    count: entries.length,
+    verified_at: new Date().toISOString()
+  };
+}
+
+/**
+ * Scoped verification helper for testing: validates hash chain among entries matching test_run_id
+ */
+async function verifyAuditChainForTestRun(testRunId) {
+  if (!testRunId) {
+    return { valid: false, reason: 'TEST_RUN_ID_REQUIRED' };
+  }
+
+  let entries = [];
+
+  if (memoryStore.audit_log && memoryStore.audit_log.length > 0) {
+    entries = memoryStore.audit_log
+      .filter((entry) => entry.detail?.test_run_id === testRunId)
+      .slice()
+      .reverse();
+  }
+
+  if (entries.length === 0 && supabase) {
+    try {
+      const { data, error } = await supabase
+        .from('audit_log')
+        .select('*')
+        .filter('detail->>test_run_id', 'eq', testRunId)
+        .order('created_at', { ascending: true });
+
+      if (!error && Array.isArray(data) && data.length > 0) {
+        entries = data;
+      }
+    } catch (e) {
+      console.error('[verifyAuditChainForTestRun Supabase Exception]:', e.message);
     }
   }
 
@@ -767,28 +892,7 @@ async function verifyAuditChain() {
 // Atomic Row-Level Locking Execution (Step 4 & Step 2/3 Core)
 // ---------------------------------------------------------------------------
 async function processAtomicBudgetDeduction(agentId, amount, merchant, idempotencyKey) {
-  // If Supabase is connected and RPC function exists, use RPC
-  if (supabase) {
-    try {
-      const { data, error } = await supabase.rpc('process_agent_budget_deduction', {
-        p_agent_id: agentId,
-        p_amount: amount,
-        p_merchant: merchant,
-        p_idempotency_key: idempotencyKey
-      });
-
-      if (!error && data) {
-        return data;
-      }
-      if (error) {
-        console.warn('[Supabase RPC Error / Fallback]:', error.message);
-      }
-    } catch (err) {
-      console.warn('[Supabase RPC] Falling back to atomic locked JS execution:', err.message);
-    }
-  }
-
-  // Row-level lock acquisition to prevent race conditions
+  // Row-level lock acquisition to prevent race conditions and guarantee valid audit log hash chaining
   const releaseLock = await acquireAgentLock(agentId);
   try {
     const agent = await getAgent(agentId);
@@ -1207,18 +1311,92 @@ async function resetDatabaseState() {
 async function clearAuditLogTable() {
   if (supabase) {
     try {
-      const { error } = await supabase
-        .from('audit_log')
-        .delete()
-        .neq('id', '00000000-0000-0000-0000-000000000000');
-      if (error) {
-        console.error('[Supabase Error in clearAuditLogTable]:', error.message);
+      let remaining = 1;
+      let iterations = 0;
+      const maxIterations = 20;
+
+      while (remaining > 0 && iterations < maxIterations) {
+        iterations++;
+        // Fetch batch of IDs to delete
+        const { data: rows, error: fetchErr } = await supabase
+          .from('audit_log')
+          .select('id')
+          .limit(500);
+
+        if (fetchErr) {
+          console.error('[Supabase Error in clearAuditLogTable select]:', fetchErr.message);
+          await supabase
+            .from('audit_log')
+            .delete()
+            .neq('id', '00000000-0000-0000-0000-000000000000');
+          break;
+        }
+
+        if (!rows || rows.length === 0) {
+          break;
+        }
+
+        const ids = rows.map((r) => r.id);
+        const { error: delErr } = await supabase
+          .from('audit_log')
+          .delete()
+          .in('id', ids);
+
+        if (delErr) {
+          console.error('[Supabase Error in clearAuditLogTable delete]:', delErr.message);
+          await supabase
+            .from('audit_log')
+            .delete()
+            .neq('id', '00000000-0000-0000-0000-000000000000');
+          break;
+        }
+
+        const { count, error: countErr } = await supabase
+          .from('audit_log')
+          .select('*', { count: 'exact', head: true });
+
+        if (!countErr && typeof count === 'number') {
+          remaining = count;
+        } else {
+          if (rows.length < 500) remaining = 0;
+        }
       }
     } catch (e) {
       console.error('[Supabase Exception in clearAuditLogTable]:', e.message);
     }
   }
   memoryStore.audit_log = [];
+}
+
+async function deleteTestAuditLogs(testRunId) {
+  let deletedCount = 0;
+
+  if (supabase) {
+    try {
+      let query = supabase.from('audit_log').delete();
+      if (testRunId) {
+        query = query.filter('detail->>test_run_id', 'eq', testRunId);
+      } else {
+        query = query.filter('detail->>test_run_id', 'not.is', null);
+      }
+
+      const { data, error } = await query.select('id');
+      if (!error && data) {
+        deletedCount = data.length;
+      }
+      console.log(`[Supabase Test Cleanup] Deleted ${deletedCount} test audit_log rows.`);
+    } catch (e) {
+      console.error('[Supabase Test Cleanup Error in deleteTestAuditLogs]:', e.message);
+    }
+  }
+
+  if (testRunId) {
+    memoryStore.audit_log = memoryStore.audit_log.filter((l) => l.detail?.test_run_id !== testRunId);
+  } else {
+    memoryStore.audit_log = memoryStore.audit_log.filter((l) => !l.detail?.test_run_id);
+  }
+
+  return deletedCount;
 }
 
 module.exports = {
@@ -1249,9 +1427,11 @@ module.exports = {
   consumeMandateNonceAtomic,
   listCatalogItems,
   verifyAuditChain,
+  verifyAuditChainForTestRun,
   canonicalJson,
   computeAuditHash,
   clearAuditLogTable,
+  deleteTestAuditLogs,
   resetDatabaseState,
   resetMemoryStore: resetDatabaseState
 };

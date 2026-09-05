@@ -8,7 +8,8 @@ const {
   issueMandate,
   getMandate,
   getMandateByNonce,
-  generateMandateChallenge
+  generateMandateChallenge,
+  clearMandateTimers
 } = require('../src/services/mandateService');
 
 const {
@@ -103,6 +104,10 @@ function createMockWebAuthnClient(options = {}) {
 }
 
 test('Mandate Service - Agent Trust Rail Issuance Tests', async (t) => {
+  t.after(() => {
+    clearMandateTimers();
+  });
+
   await t.test('1. Successful mandate issuance with valid WebAuthn assertion', async () => {
     const mockAuth = createMockWebAuthnClient();
 

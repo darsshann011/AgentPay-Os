@@ -13,6 +13,8 @@ const {
   isSupabaseConfigured,
   DEFAULT_TRAVELBOT_ID,
   deleteTestAgents,
+  deleteTestAuditLogs,
+  clearAuditLogTable,
   listAgents
 } = require('../src/db/supabaseClient');
 
@@ -21,8 +23,14 @@ async function cleanupTestData() {
   console.log('🧹 AgentPay OS - Cleaning Test Data from Supabase / Memory');
   console.log('========================================================');
 
-  const deletedCount = await deleteTestAgents();
-  console.log(`✅ Cleanup completed. Removed ${deletedCount} test agent(s).`);
+  const deletedAgentCount = await deleteTestAgents();
+  console.log(`✅ Cleanup completed. Removed ${deletedAgentCount} test agent(s).`);
+
+  const deletedAuditCount = await deleteTestAuditLogs();
+  console.log(`✅ Cleanup completed. Removed ${deletedAuditCount} test audit row(s).`);
+
+  await clearAuditLogTable();
+  console.log('✅ Audit ledger reset to clean GENESIS state.');
 
   const remainingAgents = await listAgents();
   console.log('\n📊 Remaining Agents in Database:');
@@ -30,7 +38,7 @@ async function cleanupTestData() {
     console.log(` - [${agent.id}] ${agent.name} | Budget: ₹${agent.budget_remaining} / ₹${agent.budget_total}`);
   }
   console.log('========================================================\n');
-  return deletedCount;
+  return { deletedAgentCount, deletedAuditCount };
 }
 
 if (require.main === module) {

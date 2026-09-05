@@ -7,7 +7,8 @@ const { isoBase64URL, isoCBOR } = require('@simplewebauthn/server/helpers');
 const {
   issueMandate,
   verifyMandate,
-  getVerifiedToken
+  getVerifiedToken,
+  clearMandateTimers
 } = require('../src/services/mandateService');
 
 const {
@@ -114,6 +115,10 @@ async function issueTestMandate(overrides = {}) {
 }
 
 test('Mandate Verification Service - Step 2 Tests', async (t) => {
+  t.after(() => {
+    clearMandateTimers();
+  });
+
   await t.test('1. Valid proposed transaction within mandate bounds passes verification', async () => {
     const { mandate } = await issueTestMandate({
       max_amount: 25000,

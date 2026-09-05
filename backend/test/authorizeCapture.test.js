@@ -9,7 +9,8 @@ const {
   issueMandate,
   verifyMandate,
   createVerifiedToken,
-  getVerifiedToken
+  getVerifiedToken,
+  clearMandateTimers
 } = require('../src/services/mandateService');
 
 const {
@@ -188,9 +189,13 @@ test('Authorize/Capture & Price-Drift Protection - Agent Trust Rail Step 5', asy
 
   t.after(async () => {
     if (server) {
+      if (typeof server.closeAllConnections === 'function') {
+        server.closeAllConnections();
+      }
       await new Promise((resolve) => server.close(resolve));
     }
     await deleteTestAgents();
+    clearMandateTimers();
   });
 
   await t.test('1. Successful end-to-end payment execution with valid verified_token (Authorize -> Reconfirm -> Capture)', async () => {

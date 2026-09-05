@@ -46,6 +46,9 @@ const challengeStore = new Map();
 // In-memory verified tokens cache (short-lived, 2-minute TTL)
 const verifiedTokens = new Map();
 
+// Active timers set for clean teardown during testing and graceful shutdown
+const activeTimers = new Set();
+
 /**
  * Generates WebAuthn authentication options with a secure challenge
  * @param {Object} [options]
@@ -66,9 +69,12 @@ async function generateMandateChallenge(options = {}) {
   });
 
   // Expire challenges after 5 minutes
-  setTimeout(() => {
+  const timer = setTimeout(() => {
+    activeTimers.delete(timer);
     challengeStore.delete(challenge);
   }, 5 * 60 * 1000);
+  if (timer.unref) timer.unref();
+  activeTimers.add(timer);
 
   return authOptions;
 }
@@ -533,9 +539,12 @@ function createVerifiedToken({ mandate_id, proposed_transaction, ttlSeconds = 12
   verifiedTokens.set(token, tokenRecord);
 
   // Auto clean up after expiry window
-  setTimeout(() => {
+  const timer = setTimeout(() => {
+    activeTimers.delete(timer);
     verifiedTokens.delete(token);
   }, (ttlSeconds + 60) * 1000);
+  if (timer.unref) timer.unref();
+  activeTimers.add(timer);
 
   return tokenRecord;
 }
@@ -567,6 +576,17 @@ function consumeVerifiedToken(token) {
   record.consumed = true;
   return true;
 }
+/**
+ * Clears active mandate timers and in-memory caches
+ */
+function clearMandateTimers() {
+  for (const timer of activeTimers) {
+    clearTimeout(timer);
+  }
+  activeTimers.clear();
+  challengeStore.clear();
+  verifiedTokens.clear();
+}
 
 module.exports = {
   issueMandate,
@@ -575,6 +595,7 @@ module.exports = {
   getVerifiedToken,
   consumeVerifiedToken,
   generateMandateChallenge,
+  clearMandateTimers,
   normalizePublicKeyToUint8Array,
   normalizeAssertionResponse,
   getMandate,

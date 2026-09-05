@@ -28,7 +28,7 @@ function canonicalStringify(obj) {
   if (Array.isArray(obj)) {
     return '[' + obj.map(canonicalStringify).join(',') + ']';
   }
-  const sortedKeys = Object.keys(obj).sort();
+  const sortedKeys = Object.keys(obj).filter(k => obj[k] !== undefined).sort();
   return '{' + sortedKeys.map(k => JSON.stringify(k) + ':' + canonicalStringify(obj[k])).join(',') + '}';
 }
 
