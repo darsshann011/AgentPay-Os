@@ -4,13 +4,17 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { execFile } = require('child_process');
+const { v4: uuidv4 } = require('uuid');
 
 const {
   addAuditLog,
   getAuditLogs,
   verifyAuditChain,
   resetMemoryStore,
-  computeAuditHash
+  clearAuditLogTable,
+  computeAuditHash,
+  createTransaction,
+  DEFAULT_TRAVELBOT_ID
 } = require('../src/db/supabaseClient');
 
 const app = require('../src/server');
@@ -66,15 +70,25 @@ test('Tamper-Evident Audit Log Hash Chaining - Step 6 Tests', async (t) => {
   });
 
   await t.test('1. Sequential audit writes form a valid cryptographic hash chain starting from GENESIS', async () => {
+    await clearAuditLogTable();
     await resetMemoryStore();
 
     // Write sequential events representing the trust rail lifecycle
+    const txId1 = uuidv4();
+    await createTransaction({
+      id: txId1,
+      agent_id: DEFAULT_TRAVELBOT_ID,
+      amount: 12000,
+      merchant: 'Hotel Vendor A',
+      idempotency_key: `test_ik_${txId1}`,
+      status: 'PENDING'
+    });
     const log1 = await addAuditLog(null, 'MANDATE_ISSUED', { mandate_id: 'man_1', max_amount: 25000 });
     const log2 = await addAuditLog(null, 'MANDATE_VERIFIED', { mandate_id: 'man_1', verified_token: 'vt_1' });
-    const log3 = await addAuditLog('tx_1', 'AGENT_REQUESTED', { amount: 12000, merchant: 'Hotel Vendor A' });
-    const log4 = await addAuditLog('tx_1', 'AUTHORIZED', { order_id: 'order_1', amount: 12000 });
-    const log5 = await addAuditLog('tx_1', 'CAPTURED', { payment_id: 'pay_1', amount: 12000 });
-    const log6 = await addAuditLog('tx_1', 'WEBHOOK_RECEIVED', { event: 'payment.captured' });
+    const log3 = await addAuditLog(txId1, 'AGENT_REQUESTED', { amount: 12000, merchant: 'Hotel Vendor A' });
+    const log4 = await addAuditLog(txId1, 'AUTHORIZED', { order_id: 'order_1', amount: 12000 });
+    const log5 = await addAuditLog(txId1, 'CAPTURED', { payment_id: 'pay_1', amount: 12000 });
+    const log6 = await addAuditLog(txId1, 'WEBHOOK_RECEIVED', { event: 'payment.captured' });
 
     // Verify first entry has GENESIS
     assert.equal(log1.prev_hash, 'GENESIS', 'Genesis entry must have prev_hash === GENESIS');
@@ -95,6 +109,7 @@ test('Tamper-Evident Audit Log Hash Chaining - Step 6 Tests', async (t) => {
   });
 
   await t.test('2. Tampering with an audit entry detail causes verify-chain to detect the exact broken link', async () => {
+    await clearAuditLogTable();
     await resetMemoryStore();
 
     const log1 = await addAuditLog(null, 'MANDATE_ISSUED', { max_amount: 10000 });
@@ -121,6 +136,7 @@ test('Tamper-Evident Audit Log Hash Chaining - Step 6 Tests', async (t) => {
   });
 
   await t.test('3. Tampering with prev_hash link is detected immediately', async () => {
+    await clearAuditLogTable();
     await resetMemoryStore();
 
     const log1 = await addAuditLog(null, 'MANDATE_ISSUED', { max_amount: 5000 });
@@ -137,11 +153,21 @@ test('Tamper-Evident Audit Log Hash Chaining - Step 6 Tests', async (t) => {
   });
 
   await t.test('4. Standalone CLI script verify_audit_chain.js independently validates exported logs', async () => {
+    await clearAuditLogTable();
     await resetMemoryStore();
 
+    const txId4 = uuidv4();
+    await createTransaction({
+      id: txId4,
+      agent_id: DEFAULT_TRAVELBOT_ID,
+      amount: 15000,
+      merchant: 'Hotel Vendor A',
+      idempotency_key: `test_ik_${txId4}`,
+      status: 'PENDING'
+    });
     await addAuditLog(null, 'MANDATE_ISSUED', { max_amount: 50000 });
     await addAuditLog(null, 'MANDATE_VERIFIED', { verified: true });
-    await addAuditLog('tx_99', 'CAPTURED', { amount: 15000 });
+    await addAuditLog(txId4, 'CAPTURED', { amount: 15000 });
 
     const logs = await getAuditLogs(10);
     // Export logs

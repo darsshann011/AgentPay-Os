@@ -36,12 +36,15 @@ function canonicalStringify(obj) {
  * Independent SHA-256 hash calculator for audit log entry
  */
 function calculateEntryHash(prevHash, entry) {
+  const normalizedCreatedAt = entry.created_at
+    ? (entry.created_at instanceof Date ? entry.created_at.toISOString() : new Date(entry.created_at).toISOString())
+    : new Date().toISOString();
   const canonicalPayload = canonicalStringify({
     id: entry.id,
     transaction_id: entry.transaction_id || null,
     event_type: entry.event_type,
     detail: entry.detail || {},
-    created_at: entry.created_at
+    created_at: normalizedCreatedAt
   });
   return crypto
     .createHash('sha256')

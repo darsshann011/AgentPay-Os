@@ -31,6 +31,225 @@ import {
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:4000';
 
+// ---------------------------------------------------------------------------
+// Browser-Side WebAuthn & Crypto Helpers
+// ---------------------------------------------------------------------------
+function bufferToBase64Url(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.byteLength; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary)
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+}
+
+function base64UrlToUint8Array(base64url) {
+  const base64 = base64url.replace(/-/g, '+').replace(/_/g, '/');
+  const pad = base64.length % 4;
+  const padded = pad ? base64 + '='.repeat(4 - pad) : base64;
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+function rawSignatureToDer(rawSig) {
+  const raw = new Uint8Array(rawSig);
+  const r = raw.slice(0, 32);
+  const s = raw.slice(32, 64);
+
+  function encodeInteger(bytes) {
+    let start = 0;
+    while (start < bytes.length - 1 && bytes[start] === 0) {
+      start++;
+    }
+    const sliced = bytes.slice(start);
+    if (sliced[0] & 0x80) {
+      const res = new Uint8Array(sliced.length + 1);
+      res[0] = 0x00;
+      res.set(sliced, 1);
+      return res;
+    }
+    return sliced;
+  }
+
+  const rEnc = encodeInteger(r);
+  const sEnc = encodeInteger(s);
+
+  const seqLen = 2 + rEnc.length + 2 + sEnc.length;
+  const der = new Uint8Array(2 + seqLen);
+  der[0] = 0x30; // SEQUENCE
+  der[1] = seqLen;
+  der[2] = 0x02; // INTEGER
+  der[3] = rEnc.length;
+  der.set(rEnc, 4);
+  const sOffset = 4 + rEnc.length;
+  der[sOffset] = 0x02; // INTEGER
+  der[sOffset + 1] = sEnc.length;
+  der.set(sEnc, sOffset + 2);
+
+  return der;
+}
+
+async function createBrowserWebAuthnAssertion(rpId = 'localhost', origin = 'http://localhost:3000') {
+  const cryptoObj = window.crypto;
+  const keyPair = await cryptoObj.subtle.generateKey(
+    { name: 'ECDSA', namedCurve: 'P-256' },
+    true,
+    ['sign', 'verify']
+  );
+
+  const jwk = await cryptoObj.subtle.exportKey('jwk', keyPair.publicKey);
+  const xBytes = base64UrlToUint8Array(jwk.x);
+  const yBytes = base64UrlToUint8Array(jwk.y);
+
+  // CBOR COSE Key for ES256 P-256 Map(5): { 1: 2, 3: -7, -1: 1, -2: xBytes, -3: yBytes }
+  const coseKeyBytes = new Uint8Array(77);
+  coseKeyBytes[0] = 0xa5; // map(5)
+  coseKeyBytes[1] = 0x01; // 1
+  coseKeyBytes[2] = 0x02; // 2 (EC2)
+  coseKeyBytes[3] = 0x03; // 3
+  coseKeyBytes[4] = 0x26; // -7 (ES256)
+  coseKeyBytes[5] = 0x20; // -1
+  coseKeyBytes[6] = 0x01; // 1 (P-256)
+  coseKeyBytes[7] = 0x21; // -2
+  coseKeyBytes[8] = 0x58; // bytes(32)
+  coseKeyBytes[9] = 0x20;
+  coseKeyBytes.set(xBytes, 10);
+  coseKeyBytes[42] = 0x22; // -3
+  coseKeyBytes[43] = 0x58; // bytes(32)
+  coseKeyBytes[44] = 0x20;
+  coseKeyBytes.set(yBytes, 45);
+
+  const cosePublicKeyBase64URL = bufferToBase64Url(coseKeyBytes);
+
+  const challengeBytes = new Uint8Array(32);
+  cryptoObj.getRandomValues(challengeBytes);
+  const challenge = bufferToBase64Url(challengeBytes);
+
+  const credentialIdBytes = new Uint8Array(32);
+  cryptoObj.getRandomValues(credentialIdBytes);
+  const credentialId = bufferToBase64Url(credentialIdBytes);
+
+  const clientDataJSON = JSON.stringify({
+    type: 'webauthn.get',
+    challenge,
+    origin,
+    crossOrigin: false
+  });
+  const clientDataJSONBytes = new TextEncoder().encode(clientDataJSON);
+  const clientDataJSONBase64 = bufferToBase64Url(clientDataJSONBytes);
+
+  const rpIdBytes = new TextEncoder().encode(rpId);
+  const rpIdHashBuffer = await cryptoObj.subtle.digest('SHA-256', rpIdBytes);
+  const rpIdHash = new Uint8Array(rpIdHashBuffer);
+
+  const authDataBuffer = new Uint8Array(37);
+  authDataBuffer.set(rpIdHash, 0);
+  authDataBuffer[32] = 0x05; // flags: UP + UV
+  authDataBuffer[33] = 0x00; // signCount (4 bytes: 1)
+  authDataBuffer[34] = 0x00;
+  authDataBuffer[35] = 0x00;
+  authDataBuffer[36] = 0x01;
+  const authenticatorDataBase64 = bufferToBase64Url(authDataBuffer);
+
+  const clientDataHashBuffer = await cryptoObj.subtle.digest('SHA-256', clientDataJSONBytes);
+  const clientDataHash = new Uint8Array(clientDataHashBuffer);
+
+  const signatureBase = new Uint8Array(37 + 32);
+  signatureBase.set(authDataBuffer, 0);
+  signatureBase.set(clientDataHash, 37);
+
+  const rawSignature = await cryptoObj.subtle.sign(
+    { name: 'ECDSA', hash: 'SHA-256' },
+    keyPair.privateKey,
+    signatureBase
+  );
+
+  const derSignature = rawSignatureToDer(rawSignature);
+  const signatureBase64 = bufferToBase64Url(derSignature);
+
+  return {
+    publicKeyBase64URL: cosePublicKeyBase64URL,
+    challenge,
+    origin,
+    rpId,
+    assertion: {
+      id: credentialId,
+      rawId: credentialId,
+      type: 'public-key',
+      response: {
+        clientDataJSON: clientDataJSONBase64,
+        authenticatorData: authenticatorDataBase64,
+        signature: signatureBase64,
+        userHandle: ''
+      }
+    }
+  };
+}
+
+async function computeHmacSha256(secret, message) {
+  const enc = new TextEncoder();
+  const key = await window.crypto.subtle.importKey(
+    'raw',
+    enc.encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const signature = await window.crypto.subtle.sign('HMAC', key, enc.encode(message));
+  const hashArray = Array.from(new Uint8Array(signature));
+  return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function issueAndVerifyMandate({ agentId, maxAmount, category, proposedTransaction, expiryMinutes = 60 }) {
+  const rpId = (typeof window !== 'undefined' && window.location.hostname) || 'localhost';
+  const origin = (typeof window !== 'undefined' && window.location.origin) || 'http://localhost:3000';
+  const webauthn = await createBrowserWebAuthnAssertion(rpId, origin);
+
+  const issueRes = await fetch(`${BACKEND_URL}/api/mandates/issue`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      agent_id: agentId,
+      max_amount: maxAmount,
+      merchant_category: category,
+      expiry_minutes: expiryMinutes,
+      webauthn_assertion: webauthn.assertion,
+      webauthn_public_key: webauthn.publicKeyBase64URL,
+      expected_challenge: webauthn.challenge,
+      expected_origin: webauthn.origin,
+      expected_rp_id: webauthn.rpId
+    })
+  });
+
+  const issueData = await issueRes.json();
+  if (!issueRes.ok || !issueData.mandate_id) {
+    throw new Error(issueData.message || 'Failed to issue hardware mandate');
+  }
+
+  const verifyRes = await fetch(`${BACKEND_URL}/api/mandates/verify`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      mandate_id: issueData.mandate_id,
+      proposed_transaction: proposedTransaction
+    })
+  });
+
+  const verifyData = await verifyRes.json();
+  if (!verifyData.verified_token) {
+    throw new Error(verifyData.explanation || verifyData.reason_code || 'Mandate verification failed');
+  }
+
+  return { mandate: issueData, verifyData, verifiedToken: verifyData.verified_token };
+}
+
 export default function AgentPayDashboard() {
   const [logs, setLogs] = useState([]);
   const [agents, setAgents] = useState([]);
@@ -135,40 +354,67 @@ export default function AgentPayDashboard() {
     setDemoActionStatus(`Executing Act ${actNumber}...`);
 
     try {
+      const activeAgentId = agents[0]?.id || 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11';
+
       if (actNumber === 1) {
         // Act 1: Happy Path
+        // 1. Issue Mandate (max ₹20,000, category: 'hotel')
+        // 2. Verify Mandate (proposed ₹12,000, Hotel Vendor A, hotel)
+        setDemoActionStatus('Act 1: Issuing WebAuthn Mandate (₹20,000 / hotel)...');
+        const { verifiedToken } = await issueAndVerifyMandate({
+          agentId: activeAgentId,
+          maxAmount: 20000,
+          category: 'hotel',
+          proposedTransaction: {
+            amount: 12000,
+            merchant: 'Hotel Vendor A',
+            category: 'hotel'
+          }
+        });
+
+        // 3. Submitting purchase request with verified_token
+        setDemoActionStatus('Act 1: Submitting Purchase Request with verified_token...');
         const prompt = 'Please book 2 executive deluxe rooms at Hotel Vendor A for ₹12,000 for the client summit';
         const ik = `ik_act1_demo_${Date.now()}`;
         const res = await fetch(`${BACKEND_URL}/api/agent-requests`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Idempotency-Key': ik },
-          body: JSON.stringify({ prompt })
+          body: JSON.stringify({
+            prompt,
+            agent_id: activeAgentId,
+            verified_token: verifiedToken
+          })
         });
         const data = await res.json();
         
         // Auto-simulate webhook if allowed
         if (data.decision === 'ALLOW' && data.razorpay?.id) {
           setTimeout(async () => {
+            const webhookPayload = {
+              event: 'payment.captured',
+              payload: {
+                payment: {
+                  entity: {
+                    id: `pay_${Date.now()}`,
+                    order_id: data.razorpay.id,
+                    amount: 1200000,
+                    currency: 'INR'
+                  }
+                }
+              },
+              transaction_id: data.transaction_id
+            };
+            const rawBody = JSON.stringify(webhookPayload);
+            const secret = process.env.NEXT_PUBLIC_RAZORPAY_WEBHOOK_SECRET || 'local_demo_secret_12345';
+            const signature = await computeHmacSha256(secret, rawBody);
+
             await fetch(`${BACKEND_URL}/api/webhooks/razorpay`, {
               method: 'POST',
               headers: {
                 'Content-Type': 'application/json',
-                'X-Razorpay-Signature': 'test_valid_signature'
+                'X-Razorpay-Signature': signature
               },
-              body: JSON.stringify({
-                event: 'payment.captured',
-                payload: {
-                  payment: {
-                    entity: {
-                      id: `pay_${Date.now()}`,
-                      order_id: data.razorpay.id,
-                      amount: 1200000,
-                      currency: 'INR'
-                    }
-                  }
-                },
-                transaction_id: data.transaction_id
-              })
+              body: rawBody
             });
             fetchData();
           }, 1200);
@@ -176,33 +422,90 @@ export default function AgentPayDashboard() {
         setDemoActionStatus('Act 1 (Happy Path) Executed: Allowed & Payment Created');
       } else if (actNumber === 2) {
         // Act 2: Blocked Path (> Budget)
+        // 1. Issue Mandate (max ₹100,000, category: 'hotel')
+        // 2. Verify Mandate (proposed ₹75,000, Hotel Vendor A, hotel)
+        setDemoActionStatus('Act 2: Issuing WebAuthn Mandate (₹100,000 / hotel)...');
+        const { verifiedToken } = await issueAndVerifyMandate({
+          agentId: activeAgentId,
+          maxAmount: 100000,
+          category: 'hotel',
+          proposedTransaction: {
+            amount: 75000,
+            merchant: 'Hotel Vendor A',
+            category: 'hotel'
+          }
+        });
+
+        // 3. Submitting purchase request exceeding agent budget
+        setDemoActionStatus('Act 2: Submitting Purchase Request exceeding budget...');
         const prompt = 'URGENT: Reserve the Presidential Penthouse Suite at Hotel Vendor A for ₹75,000 (Pre-approved)';
         const ik = `ik_act2_demo_${Date.now()}`;
         await fetch(`${BACKEND_URL}/api/agent-requests`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Idempotency-Key': ik },
-          body: JSON.stringify({ prompt })
+          body: JSON.stringify({
+            prompt,
+            agent_id: activeAgentId,
+            verified_token: verifiedToken
+          })
         });
         setDemoActionStatus('Act 2 (Blocked Path) Executed: Denied by Policy Engine (BUDGET_EXCEEDED)');
       } else if (actNumber === 3) {
         // Act 3: Duplicate / Race Condition
+        // Request 1: Mandate 1 (max ₹10,000 / cab) -> verify (₹2,500)
+        setDemoActionStatus('Act 3: Issuing Mandate 1 for Request 1 (₹10,000 / cab)...');
+        const mandate1 = await issueAndVerifyMandate({
+          agentId: activeAgentId,
+          maxAmount: 10000,
+          category: 'cab',
+          proposedTransaction: {
+            amount: 2500,
+            merchant: 'Cab Vendor B',
+            category: 'cab'
+          }
+        });
+
         const prompt = 'Please book airport cab transfer with Cab Vendor B for ₹2,500';
         const sharedKey = `ik_duplicate_${Date.now()}`;
         
-        // Send duplicate requests
+        // Send request 1
         await fetch(`${BACKEND_URL}/api/agent-requests`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Idempotency-Key': sharedKey },
-          body: JSON.stringify({ prompt })
+          body: JSON.stringify({
+            prompt,
+            agent_id: activeAgentId,
+            verified_token: mandate1.verifiedToken
+          })
         });
 
+        // Request 2: Mandate 2 (max ₹10,000 / cab) -> verify (₹2,500) with identical Idempotency-Key
         setTimeout(async () => {
-          await fetch(`${BACKEND_URL}/api/agent-requests`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Idempotency-Key': sharedKey },
-            body: JSON.stringify({ prompt })
-          });
-          fetchData();
+          try {
+            const mandate2 = await issueAndVerifyMandate({
+              agentId: activeAgentId,
+              maxAmount: 10000,
+              category: 'cab',
+              proposedTransaction: {
+                amount: 2500,
+                merchant: 'Cab Vendor B',
+                category: 'cab'
+              }
+            });
+
+            await fetch(`${BACKEND_URL}/api/agent-requests`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Idempotency-Key': sharedKey },
+              body: JSON.stringify({
+                prompt,
+                agent_id: activeAgentId,
+                verified_token: mandate2.verifiedToken
+              })
+            });
+            fetchData();
+          } catch (err2) {
+            console.error('Act 3 replay error:', err2);
+          }
         }, 300);
 
         setDemoActionStatus('Act 3 Executed: Replay duplicate detected & DUPLICATE_BLOCKED logged');
@@ -224,10 +527,28 @@ export default function AgentPayDashboard() {
 
     setIsSubmitting(true);
     try {
+      const activeAgentId = agents[0]?.id || 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11';
+      let verifiedToken = null;
+      try {
+        const { verifiedToken: token } = await issueAndVerifyMandate({
+          agentId: activeAgentId,
+          maxAmount: 50000,
+          category: 'ALL',
+          proposedTransaction: { amount: 5000, merchant: 'Hotel Vendor A', category: 'ALL' }
+        });
+        verifiedToken = token;
+      } catch (mErr) {
+        console.warn('Auto mandate issue for custom prompt failed:', mErr);
+      }
+
       await fetch(`${BACKEND_URL}/api/agent-requests`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt: customPrompt.trim() })
+        body: JSON.stringify({
+          prompt: customPrompt.trim(),
+          agent_id: activeAgentId,
+          verified_token: verifiedToken
+        })
       });
       setCustomPrompt('');
       await fetchData();

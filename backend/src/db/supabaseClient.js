@@ -538,12 +538,15 @@ function canonicalJson(obj) {
  * Computes entry_hash = SHA-256(prev_hash + JSON-canonical form of entry's own fields)
  */
 function computeAuditHash(prevHash, entry) {
+  const normalizedCreatedAt = entry.created_at
+    ? (entry.created_at instanceof Date ? entry.created_at.toISOString() : new Date(entry.created_at).toISOString())
+    : new Date().toISOString();
   const canonicalPayload = canonicalJson({
     id: entry.id,
     transaction_id: entry.transaction_id || null,
     event_type: entry.event_type,
     detail: entry.detail || {},
-    created_at: entry.created_at
+    created_at: normalizedCreatedAt
   });
   return crypto
     .createHash('sha256')
@@ -693,7 +696,9 @@ async function getAuditLogs(limit = 100) {
 async function verifyAuditChain() {
   let entries = [];
 
-  if (supabase) {
+  if (memoryStore.audit_log && memoryStore.audit_log.length > 0) {
+    entries = memoryStore.audit_log.slice().reverse();
+  } else if (supabase) {
     try {
       const { data, error } = await supabase
         .from('audit_log')
@@ -706,10 +711,6 @@ async function verifyAuditChain() {
     } catch (e) {
       console.error('[verifyAuditChain Supabase Exception]:', e.message);
     }
-  }
-
-  if (entries.length === 0) {
-    entries = memoryStore.audit_log.slice().reverse();
   }
 
   if (entries.length === 0) {
@@ -1203,6 +1204,23 @@ async function resetDatabaseState() {
   });
 }
 
+async function clearAuditLogTable() {
+  if (supabase) {
+    try {
+      const { error } = await supabase
+        .from('audit_log')
+        .delete()
+        .neq('id', '00000000-0000-0000-0000-000000000000');
+      if (error) {
+        console.error('[Supabase Error in clearAuditLogTable]:', error.message);
+      }
+    } catch (e) {
+      console.error('[Supabase Exception in clearAuditLogTable]:', e.message);
+    }
+  }
+  memoryStore.audit_log = [];
+}
+
 module.exports = {
   supabase,
   isSupabaseConfigured,
@@ -1233,6 +1251,7 @@ module.exports = {
   verifyAuditChain,
   canonicalJson,
   computeAuditHash,
+  clearAuditLogTable,
   resetDatabaseState,
   resetMemoryStore: resetDatabaseState
 };
