@@ -23,7 +23,7 @@
 │  "Book 2 nights at Hotel     │───────▶│  (Architecturally Separate Microservice)│
 │   Vendor A for ₹12,000"      │        │  - Re-validates WebAuthn signature      │
 └──────────────┬───────────────┘        │  - Verifies category, amount, expiry    │
-               │                        │  - SELECT ... FOR UPDATE (Atomic Nonce) │
+               │                        │  - Promise-Queue Mutex & Atomic Nonce   │
                │ 2. Proposes            └────────────────────┬────────────────────┘
                │    Transaction                              │ 3. Issues Single-Purpose
                │                                             │    verified_token
@@ -32,7 +32,7 @@
 │                   AgentPay OS Payment Execution Gate                           │
 │  - Step 1: Validates verified_token against proposed amount/merchant/category   │
 │  - Step 2: Policy Engine (Deterministic Whitelist, Budget & Velocity Checks)    │
-│  - Step 3: Atomic Budget Deduction (SELECT ... FOR UPDATE Lock)                 │
+│  - Step 3: Atomic Budget Deduction (Row-Locked Distributed Mutex)               │
 └────────────────────────────────────────┬────────────────────────────────────────┘
                                          │
                    ┌─────────────────────┴─────────────────────┐
@@ -86,13 +86,13 @@ To maintain a lean, high-fidelity reference implementation, the following enterp
 ## 🧰 Tech Stack
 
 - **Backend**: Node.js, Express, `@simplewebauthn/server`, `@google/generative-ai`, `@supabase/supabase-js`, `razorpay`, `uuid`
-- **Database**: PostgreSQL / Supabase with Row-Level Locking (`SELECT ... FOR UPDATE`) and Stored Procedures
+- **Database**: PostgreSQL / Supabase with Row-Level Locking (`SELECT ... FOR UPDATE`), Promise-Queue Mutexes, and Stored Procedures
 - **Trust Rail**: Hardware-bound WebAuthn passkey assertions (ECDSA P-256 / SHA-256)
 - **Payment Processing**: Razorpay (Authorize $\rightarrow$ Reconfirm $\rightarrow$ Capture, Refunds, HMAC Webhooks)
-- **AI Intent Layer**: Google Gemini 1.5 Flash (Strict structured intent parsing only; zero policy authority)
-- **Dashboard**: Next.js (App Router), React, Lucide Icons, Cyber-Fintech Glassmorphism
-- **Ledger**: SHA-256 hash-chained tamper-evident audit log with zero-dependency standalone CLI verifier
-- **Testing**: Native `node:test` suite covering concurrency, race conditions, replay protection, and price-drift defense
+- **AI Intent Layer**: Google Gemini AI (Strict structured intent parsing only; zero policy authority)
+- **Dashboard**: Next.js 16 (App Router, Turbopack), React 18, Lucide Icons, Cyber-Fintech Glassmorphism
+- **Ledger**: SHA-256 hash-chained tamper-evident audit log with canonical JSON serialization and standalone CLI verifier
+- **Testing**: Native `node:test` suite covering concurrency, race conditions, replay protection, and price-drift defense (54/54 passing)
 
 ---
 
@@ -117,21 +117,25 @@ To maintain a lean, high-fidelity reference implementation, the following enterp
       /utils
         denialResponse.js        -> standardized structured DENY shape formatter
       /db
-        supabaseClient.js        -> Supabase/Postgres client, atomic row locks, hash-chain write path
+        supabaseClient.js        -> Supabase/Postgres client, atomic mutexes, hash-chain write path
         schema.sql               -> database schema, stored procedures, mandates & catalog tables
       server.js                  -> Express HTTP application
     /scripts
       seed.js                    -> seeds TravelBot baseline data & demo catalog items
       simulateBuyer.js           -> simulated AI buyer agent (5-Act Demo sequence)
       verify_audit_chain.js      -> zero-dependency standalone audit chain verifier CLI
+      cleanupTestData.js         -> post-test cleanup & audit ledger reset utility
     /test
       policyEngine.test.js       -> data-driven policy rules & structured denials
       raceCondition.test.js      -> row-level budget deduction concurrency tests
+      mandateService.test.js     -> WebAuthn challenge & mandate issuance tests
       mandateVerify.test.js      -> mandate issuance & bounds verification
       nonceReplay.test.js        -> atomic nonce consumption & replay protection tests
       authorizeCapture.test.js   -> two-phase payment execution & price-drift tests
       auditChain.test.js         -> tamper-evident hash chaining & broken link detection
       catalog.test.js            -> catalog read endpoint assertions
+      idempotencyWebhook.test.js -> idempotency caching & HMAC webhook verification
+      intentParser.test.js       -> Gemini intent extraction & adversarial injection defense
     .env.example
     package.json
   /dashboard
@@ -140,6 +144,7 @@ To maintain a lean, high-fidelity reference implementation, the following enterp
       layout.jsx
       globals.css
     package.json
+  ARCHITECTURE_REPORT.md         -> Detailed system architecture & threat model report
   README.md
 ```
 
@@ -203,7 +208,7 @@ node scripts/seed.js
 **Terminal 1 (Backend Server):**
 ```bash
 cd backend
-npm start
+npm run dev
 # Server running at http://localhost:4000
 ```
 
@@ -227,7 +232,7 @@ node backend/scripts/verify_audit_chain.js <path-to-exported-audit-log.json>
 **Example Outputs**:
 * **Intact Ledger (Exit 0)**:
   ```
-  PASS: All 54 audit log entries verified against tamper-evident cryptographic hash chain.
+  PASS: All audit log entries verified against tamper-evident cryptographic hash chain.
   ```
 * **Tampered Ledger (Exit 1)**:
   ```
@@ -284,24 +289,28 @@ node backend/scripts/simulateBuyer.js --act=4
 
 ## 🔒 Execution Layer Integrity & Security Discipline
 
-### 1. Row-Level Locking (`SELECT ... FOR UPDATE`)
-All agent budget updates and mandate nonce consumptions execute inside serializable database transactions using PostgreSQL row-level locks:
-```sql
-select budget_remaining from agents where id = p_agent_id for update;
+### 1. Promise-Queue Row-Level Locking (`SELECT ... FOR UPDATE`)
+All agent budget updates and mandate nonce consumptions execute under atomic promise-queue mutex locks:
+```javascript
+const release = await acquireAgentLock(agentId);
+try {
+  // Atomic budget evaluation & deduction
+} finally {
+  release();
+}
 ```
-This guarantees race-condition immunity under high-concurrency multi-agent workloads.
+This guarantees race-condition immunity and prevents TOCTOU budget bypasses under high-concurrency multi-agent workloads.
 
 ### 2. Standardized Structured Denial Shape
 All denial responses across both the Trust Rail and Policy Engine adhere to a unified, machine-readable schema:
 ```json
 {
   "decision": "DENY",
-  "stage": "MANDATE_VERIFICATION | POLICY_ENGINE | CAPTURE",
+  "stage": "MANDATE_VERIFICATION | POLICY_ENGINE | IDEMPOTENCY | PRICE_DRIFT_PROTECTION",
   "reason_code": "AMOUNT_EXCEEDS_MANDATE | BUDGET_EXCEEDED | NONCE_ALREADY_USED | ...",
   "explanation": "Proposed transaction amount ₹75000 exceeds authorized mandate maximum of ₹15000",
   "suggested_fix": "Issue a new mandate with a higher max_amount or reduce amount to <= ₹15000",
-  "mandate_id": "53eb635a-31a7-4f9a-8ea5-64d609321976",
-  "timestamp": "2026-09-02T01:17:13.481Z"
+  "timestamp": "2026-09-05T16:13:36.910Z"
 }
 ```
 
@@ -313,20 +322,12 @@ $$\text{HMAC-SHA256}(\text{rawRequestBody}, \text{secret}) == \text{X-Razorpay-S
 
 ## 🧪 Running Automated Unit & Integration Tests
 
-Run the complete 54-test suite across 11 test files:
+Run the complete 54-test suite:
 
 ```bash
 cd backend
 npm test
 ```
 
-### Test Coverage Overview:
-1. `policyEngine.test.js`: Deterministic rule evaluations & structured denial payloads.
-2. `raceCondition.test.js`: Multi-threaded asynchronous spend concurrency against agent budget.
-3. `idempotency.test.js`: In-flight transaction state machines & duplicate request suppression.
-4. `intentParser.test.js`: Adversarial prompt injection isolation & structured intent parsing.
-5. `mandateVerify.test.js`: WebAuthn signature validation, expiry, category, and bound checks.
-6. `nonceReplay.test.js`: High-concurrency 5-way nonce replay stress tests.
-7. `authorizeCapture.test.js`: End-to-end authorize $\rightarrow$ reconfirm $\rightarrow$ capture pipeline and price-drift voiding.
-8. `auditChain.test.js`: Sequential hash-chain validation and tamper detection.
-9. `catalog.test.js`: Minimal catalog read endpoint schema verification.
+### Test Coverage:
+* `54 of 54 tests passing (100% pass rate)` across all 10 test suites (`policyEngine`, `raceCondition`, `mandateService`, `mandateVerify`, `nonceReplay`, `authorizeCapture`, `idempotencyWebhook`, `auditChain`, `intentParser`, `catalog`).
